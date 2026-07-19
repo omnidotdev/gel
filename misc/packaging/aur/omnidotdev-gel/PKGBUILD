@@ -1,0 +1,23 @@
+# Maintainer: Omni <team@omni.dev>
+pkgname=omnidotdev-gel
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Declarative system management for Arch Linux"
+arch=('x86_64')
+url="https://gel.omni.dev"
+license=('Apache-2.0')
+depends=()
+makedepends=('cargo')
+source=("https://github.com/omnidotdev/gel/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "gel-$pkgver"
+  cargo build --release
+}
+
+package() {
+  cd "gel-$pkgver"
+  install -Dm755 "target/release/gel" "$pkgdir/usr/bin/gel"
+  install -Dm644 "LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
