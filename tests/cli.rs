@@ -1,9 +1,13 @@
 //! Behavioral CLI tests that are safe to run on any host
 //!
-//! These drive the built `gel` binary but never touch system package state.
-//! `gel eval` is pure (it runs cargo and writes a file), so exercising its error
-//! paths here is safe. The full `gel eval examples/host-config` round-trip is
-//! exercised manually (it compiles a separate crate); see README.md.
+//! These drive the built `gel` binary but never touch system package state. In
+//! the default (no `arch` feature) build, every system-touching subcommand must
+//! fast-fail with a clear rebuild message before doing anything, so exercising
+//! them here is safe. `env!("CARGO_BIN_EXE_gel")` resolves to the binary built
+//! for the current feature set, which for a plain `cargo test` is the pure one.
+//!
+//! The full `gel eval examples/host-config` round-trip is exercised manually
+//! (it compiles a separate crate); see README.md and crates/gel-core/TESTING.md.
 
 use std::process::Command;
 
@@ -16,6 +20,31 @@ fn run_gel(args: &[&str]) -> (bool, String) {
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     (output.status.success(), combined)
+}
+
+#[cfg(not(feature = "arch"))]
+#[test]
+fn system_commands_fast_fail_without_arch_feature() {
+    // each system-touching subcommand must exit non-zero with the rebuild hint
+    // and must not touch the host; a plain `cargo test` builds the pure binary
+    for args in [
+        vec!["diff"],
+        vec!["apply"],
+        vec!["import"],
+        vec!["rollback"],
+    ] {
+        let (success, out) = run_gel(&args);
+        assert!(
+            !success,
+            "`gel {}` should fail without arch support",
+            args[0]
+        );
+        assert!(
+            out.contains("rebuild with --features arch"),
+            "`gel {}` should mention the rebuild path, got: {out}",
+            args[0]
+        );
+    }
 }
 
 #[test]
@@ -37,4 +66,5 @@ fn help_documents_the_eval_apply_split() {
 
     assert!(success, "--help should succeed");
     assert!(out.contains("Eval/apply split"));
+    assert!(out.contains("--features arch"));
 }

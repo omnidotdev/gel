@@ -33,6 +33,80 @@ cargo build --release
 gel --help
 ```
 
+## Usage
+
+gel manages the explicitly installed packages on an Arch machine declaratively.
+You describe the machine you want in a small Rust config crate, then converge the
+system toward it. The workflow is an **eval/apply split**: evaluating your config
+into an artifact is pure and safe, while touching the system is a separate step.
+
+### 1. Author a config
+
+A gel config is an ordinary Rust program that builds a `System` and prints the
+resulting desired state as JSON. See [`examples/host-config`](examples/host-config)
+for a complete crate:
+
+```rust
+use gel_core::config::System;
+
+fn main() {
+    let system = System::new()
+        .native(["git", "ripgrep", "fd", "bat"]) // official-repo packages (pacman)
+        .foreign(["paru"]); // AUR packages (AUR helper)
+    print!("{}", serde_json::to_string(&system.build()).expect("serialize"));
+}
+```
+
+`System::build()` sorts and deduplicates each list, so authoring order does not
+matter.
+
+### 2. Evaluate (pure, always available)
+
+`gel eval` compiles and runs the config crate and writes the desired state to an
+artifact. This runs cargo and writes a file; it never touches packages, so it
+works in any build:
+
+```sh
+gel eval examples/host-config            # writes the default artifact
+gel eval examples/host-config --out /tmp/desired.json
+```
+
+### 3. Diff and apply (require an Arch build)
+
+```sh
+gel diff                 # preview the plan: +N to install, -N to remove (read-only)
+gel apply                # additive converge: install what is missing
+gel apply --prune        # also remove explicit packages absent from the config
+gel import               # capture the current explicit packages as a desired state
+gel rollback             # invert the most recent apply at the package level
+```
+
+`apply` takes a filesystem snapshot first (via snapper on btrfs; it degrades to a
+warning when snapshots are unavailable), prints the plan, converges, and records a
+transaction in the journal so it can be rolled back. `rollback` reverses packages
+only; snapshot-based filesystem restore is planned for a later phase.
+
+### The `arch` feature
+
+The system-touching commands (`import`, `diff`, `apply`, `rollback`) drive real
+`pacman`/AUR-helper/snapper tooling and are only compiled with the `arch` feature:
+
+```sh
+cargo build --release --features arch    # binary with the real Arch backend
+```
+
+The default build is pure: those subcommands fast-fail with a clear rebuild
+message and nothing touches the host, while `gel eval` still works.
+
+### Locations
+
+gel keeps its state under `${XDG_STATE_HOME:-~/.local/state}/gel`:
+
+| Path | Purpose |
+| --- | --- |
+| `<state-dir>/desired.json` | default desired-state artifact (override with `--out`/`--artifact`) |
+| `<state-dir>/journal/` | transaction journal used by `rollback` |
+
 ## Development
 
 ### Prerequisites

@@ -20,6 +20,12 @@ readme = "README.md"
 name = "gel"
 path = "src/main.rs"
 
+[features]
+# Enable the real Arch backend and btrfs snapshot provider. Without it the
+# system-touching subcommands (import/diff/apply/rollback) fast-fail with a
+# clear rebuild message and nothing touches the host.
+arch = ["gel-core/arch"]
+
 [dependencies]
 gel-core = { path = "crates/gel-core" }
 clap = { version = "4", features = ["derive", "env"] }

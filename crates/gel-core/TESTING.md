@@ -8,7 +8,26 @@ The default build is pure and free of OS side effects. Run everything with:
 cargo test --workspace
 ```
 
-This never requires the `arch` feature, root, a container, or network access.
+This never requires the `arch` feature, root, a container, or network access. It
+covers gel-core (the pure engine, including the `System` config builder) and the
+`gel` binary's own tests (`tests/cli.rs` and the `eval` parse unit tests).
+
+The CLI tests are safe on any host: the default (no `arch` feature) build makes
+every system-touching subcommand (`import`/`diff`/`apply`/`rollback`) fast-fail
+with a rebuild message before doing anything, so `tests/cli.rs` exercises that
+path without touching packages. `gel eval` is pure (it runs cargo and writes a
+file), so its output-parsing logic is unit tested directly with known JSON.
+
+### Manual: full `gel eval` round-trip
+
+Exercising `gel eval` end to end compiles the separate `examples/host-config`
+crate, which is too heavy for the default test run, so verify it manually. This
+is safe (it only runs cargo and writes a file, never touching packages):
+
+```bash
+gel eval examples/host-config --out /tmp/desired.json
+cat /tmp/desired.json   # a DesiredState: sorted, deduplicated native + foreign
+```
 
 The real Arch backend (`ArchBackend`) and btrfs snapshot provider
 (`BtrfsSnapshot`) route all process execution through a `CommandRunner` seam, so
@@ -51,6 +70,15 @@ Coverage inside the container:
   absent (safe and containerable)
 
 ### Known gaps / manual steps
+
+- end-to-end CLI flow in the container: driving the built `gel --features arch`
+  binary through `import` -> edit -> `diff` -> `apply` -> `rollback` inside the
+  disposable container is not yet automated. The engine and each backend are
+  covered (mock-runner unit tests plus the `arch_integration.rs` native pacman
+  round-trip), and the CLI wiring is covered by `tests/cli.rs`, so this is a
+  deferred nice-to-have rather than a coverage hole. Until it lands, verify the
+  full binary flow manually with `scripts/test-arch.sh` open (root shell in the
+  container), running the `gel` subcommands by hand.
 
 - AUR helper path: pacman requires root, so the container runs the tests as
   root; AUR helpers (`paru`/`yay`) refuse to run as root. The image already
