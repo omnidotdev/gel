@@ -9,6 +9,7 @@ pub mod backend;
 pub mod error;
 pub mod import;
 pub mod plan;
+pub mod snapshot;
 pub mod state;
 
 pub use backend::PackageBackend;
