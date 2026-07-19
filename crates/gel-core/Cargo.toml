@@ -14,11 +14,17 @@ categories = ["config", "os"]
 [features]
 # Expose in-memory test doubles (e.g. FakeBackend) to downstream crates
 test-util = []
+# Real Arch Linux package backend and btrfs snapshot provider
+#
+# Non-default: pulls in system tooling (an AUR-helper/pacman probe via `which`)
+# and OS-touching code. The default build enables none of this and stays pure.
+arch = ["dep:which"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+which = { version = "8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

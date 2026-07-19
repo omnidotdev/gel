@@ -13,5 +13,10 @@ pub mod plan;
 pub mod snapshot;
 pub mod state;
 
+// Real OS-touching implementations, compiled only with the `arch` feature. The
+// default build enables none of this and remains pure.
+#[cfg(feature = "arch")]
+pub mod sys;
+
 pub use backend::PackageBackend;
 pub use error::GelError;

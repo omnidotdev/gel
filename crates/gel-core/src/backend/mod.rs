@@ -3,6 +3,10 @@ use crate::{error::GelError, state::SystemState};
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake;
 
+// Real Arch Linux backend, compiled only with the `arch` feature
+#[cfg(feature = "arch")]
+pub mod arch;
+
 /// An abstraction over a system package manager
 ///
 /// Implementations perform the real side effects (querying, installing, and
