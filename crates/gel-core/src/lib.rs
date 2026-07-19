@@ -3,4 +3,5 @@
 //! This crate is intentionally pure and free of system/OS side effects. Later
 //! tasks fill in the modules; this scaffold leaves it deliberately empty.
 
+pub mod plan;
 pub mod state;
