@@ -11,12 +11,14 @@ homepage = "https://gel.omni.dev"
 keywords = ["arch-linux", "declarative", "system", "configuration"]
 categories = ["config", "os"]
 
+[features]
+# Expose in-memory test doubles (e.g. FakeBackend) to downstream crates
+test-util = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-
-[dev-dependencies]
 serde_json = "1"
+thiserror = "2"
 
 [lints.rust]
 unsafe_code = "forbid"
