@@ -176,4 +176,33 @@ mod tests {
             &[Call::InstallNative(vec!["ripgrep".to_owned()])]
         );
     }
+
+    #[test]
+    fn injected_failure_is_one_shot() {
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        backend.set_fail_on(Call::InstallNative(Vec::new()));
+
+        // first matching call fails and does not mutate state
+        let first = backend.install_native(&["git".to_owned()]);
+        assert!(first.is_err());
+        assert!(
+            !backend
+                .query_explicit()
+                .expect("query")
+                .native
+                .contains(&"git".to_owned())
+        );
+
+        // the next matching call succeeds now that the failure is consumed
+        backend
+            .install_native(&["git".to_owned()])
+            .expect("install");
+        assert!(
+            backend
+                .query_explicit()
+                .expect("query")
+                .native
+                .contains(&"git".to_owned())
+        );
+    }
 }

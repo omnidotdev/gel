@@ -29,17 +29,22 @@ pub struct JournalEntry {
 
 /// Write `entry` as JSON to `dir`, named by its id, creating `dir` if needed
 ///
-/// This is the only function in the core that writes to the filesystem.
+/// This is the only function in the core that writes to the filesystem. The
+/// write is atomic: the JSON is written to a temporary sibling file and then
+/// renamed into place, so a crash mid-write cannot leave a partially written,
+/// unparseable entry at the final path (rename is atomic on POSIX).
 ///
 /// # Errors
 ///
 /// Returns [`GelError`] if the directory cannot be created, serialization
-/// fails, or the file cannot be written.
+/// fails, or the file cannot be written or renamed.
 pub fn write_entry(dir: &Path, entry: &JournalEntry) -> Result<(), GelError> {
     fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", entry.id));
+    let tmp = dir.join(format!("{}.json.tmp", entry.id));
     let json = serde_json::to_string_pretty(entry)?;
-    fs::write(path, json)?;
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -94,7 +99,10 @@ pub fn rollback_last(dir: &Path, b: &mut impl PackageBackend) -> Result<(), GelE
 /// Read and deserialize every `.json` entry in `dir`
 ///
 /// A missing directory yields an empty vector rather than an error, so an
-/// unwritten journal reads cleanly.
+/// unwritten journal reads cleanly. Files that fail to deserialize are skipped
+/// rather than failing the whole read, so a single corrupt entry (for example
+/// a torn write from an earlier crash) cannot block rollback of the good
+/// entries. Non-`.json` files are ignored.
 fn read_all(dir: &Path) -> Result<Vec<JournalEntry>, GelError> {
     let read_dir = match fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -108,8 +116,10 @@ fn read_all(dir: &Path) -> Result<Vec<JournalEntry>, GelError> {
             continue;
         }
         let json = fs::read_to_string(&path)?;
-        let entry: JournalEntry = serde_json::from_str(&json)?;
-        entries.push(entry);
+        // skip entries that fail to parse so one corrupt file cannot block the rest
+        if let Ok(entry) = serde_json::from_str::<JournalEntry>(&json) {
+            entries.push(entry);
+        }
     }
     Ok(entries)
 }
@@ -177,6 +187,19 @@ mod tests {
         let latest = read_latest(&missing).expect("read");
 
         assert_eq!(latest, None);
+    }
+
+    #[test]
+    fn read_latest_skips_corrupt_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid = entry("tx-1", "2026-07-19T00:00:00Z", Plan::default());
+        write_entry(dir.path(), &valid).expect("write");
+        // a corrupt sibling json file must not block reading the good entry
+        std::fs::write(dir.path().join("tx-2.json"), b"{ not valid json").expect("write corrupt");
+
+        let latest = read_latest(dir.path()).expect("read").expect("some entry");
+
+        assert_eq!(latest, valid);
     }
 
     #[test]

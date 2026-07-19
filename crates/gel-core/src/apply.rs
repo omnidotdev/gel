@@ -10,12 +10,15 @@ pub struct ApplyOpts {
     pub prune: bool,
 }
 
-/// Reconcile a backend toward `desired`, returning the plan that was computed
+/// Reconcile a backend toward `desired`, returning the effective plan applied
 ///
 /// Installs are always applied. Removals are only executed when `opts.prune`
-/// is set; otherwise the returned plan still reports them so callers can see
-/// what a prune would do. The returned [`Plan`] always reflects the full diff,
-/// independent of whether removals were executed.
+/// is set. The returned [`Plan`] is the EFFECTIVE plan: it equals what was
+/// actually executed, so in additive mode (`prune` off) its `native_remove`
+/// and `foreign_remove` are empty. This makes the returned plan safe to
+/// journal for rollback, since inverting it can only undo operations that
+/// really happened. To preview what a prune would remove without executing it,
+/// use [`Plan::compute`] directly.
 ///
 /// # Errors
 ///
@@ -26,7 +29,7 @@ pub fn apply(
     opts: ApplyOpts,
 ) -> Result<Plan, GelError> {
     let current = b.query_explicit()?;
-    let plan = Plan::compute(&current, desired);
+    let mut plan = Plan::compute(&current, desired);
     if !plan.native_install.is_empty() {
         b.install_native(&plan.native_install)?;
     }
@@ -40,6 +43,10 @@ pub fn apply(
         if !plan.foreign_remove.is_empty() {
             b.remove_foreign(&plan.foreign_remove)?;
         }
+    } else {
+        // additive mode executes no removals, so the effective plan carries none
+        plan.native_remove.clear();
+        plan.foreign_remove.clear();
     }
     Ok(plan)
 }
@@ -67,8 +74,10 @@ mod tests {
         assert!(state.native.contains(&"ripgrep".to_owned()));
         assert!(state.native.contains(&"vim".to_owned()));
 
-        // the plan still reports vim as a removal even though it was not executed
-        assert_eq!(plan.native_remove, vec!["vim".to_owned()]);
+        // the returned plan is the EFFECTIVE plan: removes are cleared because
+        // prune is off, so what apply returns equals what it executed
+        assert!(plan.native_remove.is_empty());
+        assert!(plan.foreign_remove.is_empty());
 
         // no remove call was ever made
         assert_eq!(
@@ -95,6 +104,42 @@ mod tests {
             backend.calls(),
             &[Call::RemoveNative(vec!["vim".to_owned()])]
         );
+    }
+
+    #[test]
+    fn rollback_of_effective_plan_does_not_resurrect_kept_packages() {
+        use crate::journal::{JournalEntry, rollback_last, write_entry};
+
+        // additive apply: install ripgrep, keep vim (never removed)
+        let mut backend = FakeBackend::with_explicit(&["git", "vim"], &[]);
+        let desired = DesiredState {
+            native: vec!["git".to_owned(), "ripgrep".to_owned()],
+            foreign: vec![],
+        };
+        let plan = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // journal the EFFECTIVE plan that apply returned
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan,
+            snapshot: None,
+        };
+        write_entry(dir.path(), &entry).expect("write");
+
+        // rollback only inverts installs that actually happened; vim is untouched
+        let mut rollback_backend = FakeBackend::with_explicit(&["git", "vim", "ripgrep"], &[]);
+        rollback_last(dir.path(), &mut rollback_backend).expect("rollback");
+
+        // no install issued for the kept vim, only ripgrep removed
+        assert_eq!(
+            rollback_backend.calls(),
+            &[Call::RemoveNative(vec!["ripgrep".to_owned()])]
+        );
+        let state = rollback_backend.query_explicit().expect("query");
+        assert!(state.native.contains(&"vim".to_owned()));
+        assert!(!state.native.contains(&"ripgrep".to_owned()));
     }
 
     #[test]
