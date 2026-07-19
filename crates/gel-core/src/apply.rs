@@ -98,6 +98,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_propagates_backend_failure_after_prior_calls() {
+        // fail when foreign install is attempted, after native install succeeds
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        backend.set_fail_on(Call::InstallForeign(Vec::new()));
+        let desired = DesiredState {
+            native: vec!["git".to_owned()],
+            foreign: vec!["yay".to_owned()],
+        };
+
+        let result = apply(&mut backend, &desired, ApplyOpts { prune: false });
+
+        assert!(result.is_err());
+        // the native install already ran and remains observable, and the
+        // failed foreign attempt is recorded as intent before it errored
+        assert_eq!(
+            backend.calls(),
+            &[
+                Call::InstallNative(vec!["git".to_owned()]),
+                Call::InstallForeign(vec!["yay".to_owned()]),
+            ]
+        );
+        // the native package was actually installed, the foreign one was not
+        let state = backend.query_explicit().expect("query");
+        assert!(state.native.contains(&"git".to_owned()));
+        assert!(!state.foreign.contains(&"yay".to_owned()));
+    }
+
+    #[test]
     fn foreign_path_installs_and_prunes_symmetrically() {
         let mut backend = FakeBackend::with_explicit(&[], &["old-aur", "keep-aur"]);
         let desired = DesiredState {

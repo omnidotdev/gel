@@ -23,6 +23,7 @@ pub struct FakeBackend {
     native: Vec<String>,
     foreign: Vec<String>,
     calls: Vec<Call>,
+    fail_on: Option<Call>,
 }
 
 impl FakeBackend {
@@ -33,6 +34,7 @@ impl FakeBackend {
             native: native.iter().map(|s| (*s).to_owned()).collect(),
             foreign: foreign.iter().map(|s| (*s).to_owned()).collect(),
             calls: Vec::new(),
+            fail_on: None,
         }
     }
 
@@ -40,6 +42,32 @@ impl FakeBackend {
     #[must_use]
     pub fn calls(&self) -> &[Call] {
         &self.calls
+    }
+
+    /// Inject a one-shot failure on the next mutator matching `call`'s variant
+    ///
+    /// Matching is by [`Call`] variant, not by package contents, so the exact
+    /// packages passed to the failing call do not need to be known in advance.
+    /// The next matching mutator records its attempted call, then returns an
+    /// error without mutating state; subsequent calls of that variant succeed.
+    pub fn set_fail_on(&mut self, call: Call) {
+        self.fail_on = Some(call);
+    }
+
+    /// Consume a queued failure when its variant matches `call`
+    ///
+    /// Returns true when the pending `fail_on` matches, clearing it so only the
+    /// next matching mutator fails
+    fn take_failure(&mut self, call: &Call) -> bool {
+        if self
+            .fail_on
+            .as_ref()
+            .is_some_and(|target| std::mem::discriminant(target) == std::mem::discriminant(call))
+        {
+            self.fail_on = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -66,26 +94,54 @@ impl PackageBackend for FakeBackend {
     }
 
     fn install_native(&mut self, pkgs: &[String]) -> Result<(), GelError> {
+        let call = Call::InstallNative(pkgs.to_vec());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend(
+                "injected install_native failure".to_owned(),
+            ));
+        }
         add_missing(&mut self.native, pkgs);
-        self.calls.push(Call::InstallNative(pkgs.to_vec()));
+        self.calls.push(call);
         Ok(())
     }
 
     fn remove_native(&mut self, pkgs: &[String]) -> Result<(), GelError> {
+        let call = Call::RemoveNative(pkgs.to_vec());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend(
+                "injected remove_native failure".to_owned(),
+            ));
+        }
         remove_present(&mut self.native, pkgs);
-        self.calls.push(Call::RemoveNative(pkgs.to_vec()));
+        self.calls.push(call);
         Ok(())
     }
 
     fn install_foreign(&mut self, pkgs: &[String]) -> Result<(), GelError> {
+        let call = Call::InstallForeign(pkgs.to_vec());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend(
+                "injected install_foreign failure".to_owned(),
+            ));
+        }
         add_missing(&mut self.foreign, pkgs);
-        self.calls.push(Call::InstallForeign(pkgs.to_vec()));
+        self.calls.push(call);
         Ok(())
     }
 
     fn remove_foreign(&mut self, pkgs: &[String]) -> Result<(), GelError> {
+        let call = Call::RemoveForeign(pkgs.to_vec());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend(
+                "injected remove_foreign failure".to_owned(),
+            ));
+        }
         remove_present(&mut self.foreign, pkgs);
-        self.calls.push(Call::RemoveForeign(pkgs.to_vec()));
+        self.calls.push(call);
         Ok(())
     }
 }
