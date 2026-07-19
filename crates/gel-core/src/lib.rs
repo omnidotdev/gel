@@ -6,6 +6,7 @@
 
 pub mod apply;
 pub mod backend;
+pub mod config;
 pub mod error;
 pub mod import;
 pub mod journal;
