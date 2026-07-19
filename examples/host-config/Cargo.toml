@@ -1,0 +1,24 @@
+# Standalone example of a user-authored gel config crate
+#
+# This is intentionally NOT a member of the gel workspace: it is its own tiny
+# workspace root (note the empty `[workspace]` table below) so that the main
+# `cargo test --workspace` / `cargo clippy --workspace` stay focused on gel and
+# gel-core. `gel eval examples/host-config` compiles and runs it on demand.
+[package]
+name = "host-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# Empty table: makes this crate its own workspace root, independent of the
+# parent gel workspace it happens to live inside.
+[workspace]
+
+[[bin]]
+name = "host-config"
+path = "src/main.rs"
+
+[dependencies]
+gel-core = { path = "../../crates/gel-core" }
+serde_json = "1"
