@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::state::DesiredState;
 
 /// A deterministic set of package changes to reconcile current with desired
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     pub native_install: Vec<String>,
     pub native_remove: Vec<String>,

@@ -8,6 +8,7 @@ pub mod apply;
 pub mod backend;
 pub mod error;
 pub mod import;
+pub mod journal;
 pub mod plan;
 pub mod snapshot;
 pub mod state;
