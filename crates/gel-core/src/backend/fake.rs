@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
 use crate::{
-    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
+    backend::{
+        PackageBackend, file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
+    },
     error::GelError,
-    state::SystemState,
+    state::{SettingKey, SystemState},
 };
 
 /// A recorded backend operation, in the order it was invoked
@@ -25,22 +27,25 @@ pub enum Call {
     EnableService(String),
     /// `disable` was called for this unit
     DisableService(String),
+    /// `set` was called for this setting with this value
+    SetSetting(SettingKey, String),
 }
 
-/// An in-memory backend for tests, implementing all three backend traits
+/// An in-memory backend for tests, implementing all four backend traits
 ///
 /// It implements [`PackageBackend`], [`FileBackend`](crate::backend::file::FileBackend),
-/// and [`ServiceBackend`], holding native and foreign package sets, a map of
-/// managed files, and a map of unit enabled-states. It mutates them on
-/// install/remove, write/remove, and enable/disable, recording an ordered log of
-/// every mutating call so tests can assert both resulting state and the exact
-/// operations performed.
+/// [`ServiceBackend`], and [`SettingsBackend`], holding native and foreign
+/// package sets, a map of managed files, a map of unit enabled-states, and a map
+/// of setting values. It mutates them on install/remove, write/remove,
+/// enable/disable, and set, recording an ordered log of every mutating call so
+/// tests can assert both resulting state and the exact operations performed.
 #[derive(Debug, Default, Clone)]
 pub struct FakeBackend {
     native: Vec<String>,
     foreign: Vec<String>,
     files: HashMap<String, String>,
     services: HashMap<String, bool>,
+    settings: HashMap<SettingKey, String>,
     calls: Vec<Call>,
     fail_on: Option<Call>,
 }
@@ -73,6 +78,18 @@ impl FakeBackend {
     pub fn with_enabled(units: &[&str]) -> Self {
         Self {
             services: units.iter().map(|u| ((*u).to_owned(), true)).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Construct a backend seeded with the given settings as `(key, value)` pairs
+    #[must_use]
+    pub fn with_settings(settings: &[(SettingKey, &str)]) -> Self {
+        Self {
+            settings: settings
+                .iter()
+                .map(|(key, value)| (*key, (*value).to_owned()))
+                .collect(),
             ..Self::default()
         }
     }
@@ -245,6 +262,23 @@ impl ServiceBackend for FakeBackend {
             return Err(GelError::Backend("injected disable failure".to_owned()));
         }
         self.services.insert(unit.to_owned(), false);
+        self.calls.push(call);
+        Ok(())
+    }
+}
+
+impl SettingsBackend for FakeBackend {
+    fn get(&self, key: SettingKey) -> Result<Option<String>, GelError> {
+        Ok(self.settings.get(&key).cloned())
+    }
+
+    fn set(&mut self, key: SettingKey, value: &str) -> Result<(), GelError> {
+        let call = Call::SetSetting(key, value.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected set failure".to_owned()));
+        }
+        self.settings.insert(key, value.to_owned());
         self.calls.push(call);
         Ok(())
     }
@@ -426,6 +460,72 @@ mod tests {
         // the next matching enable succeeds now that the failure is consumed
         backend.enable("sshd.service").expect("enable");
         assert!(backend.is_enabled("sshd.service").expect("query"));
+    }
+
+    #[test]
+    fn set_setting_stores_value_and_records_call() {
+        use crate::{backend::settings::SettingsBackend, state::SettingKey};
+
+        let mut backend = FakeBackend::default();
+
+        backend.set(SettingKey::Hostname, "gelbox").expect("set");
+
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("get"),
+            Some("gelbox".to_owned())
+        );
+        assert_eq!(
+            backend.calls(),
+            &[Call::SetSetting(SettingKey::Hostname, "gelbox".to_owned())]
+        );
+    }
+
+    #[test]
+    fn get_setting_is_none_until_set_then_some() {
+        use crate::{backend::settings::SettingsBackend, state::SettingKey};
+
+        let mut backend = FakeBackend::default();
+
+        assert_eq!(backend.get(SettingKey::Timezone).expect("get"), None);
+
+        backend.set(SettingKey::Timezone, "UTC").expect("set");
+
+        assert_eq!(
+            backend.get(SettingKey::Timezone).expect("get"),
+            Some("UTC".to_owned())
+        );
+    }
+
+    #[test]
+    fn seeded_setting_reads_back() {
+        use crate::{backend::settings::SettingsBackend, state::SettingKey};
+
+        let backend = FakeBackend::with_settings(&[(SettingKey::Locale, "en_US.UTF-8")]);
+
+        assert_eq!(
+            backend.get(SettingKey::Locale).expect("get"),
+            Some("en_US.UTF-8".to_owned())
+        );
+    }
+
+    #[test]
+    fn injected_set_setting_failure_is_one_shot() {
+        use crate::{backend::settings::SettingsBackend, state::SettingKey};
+
+        let mut backend = FakeBackend::default();
+        backend.set_fail_on(Call::SetSetting(SettingKey::Hostname, String::new()));
+
+        // first matching set fails and does not mutate state
+        let first = backend.set(SettingKey::Hostname, "gelbox");
+        assert!(first.is_err());
+        assert_eq!(backend.get(SettingKey::Hostname).expect("get"), None);
+
+        // the next matching set succeeds now that the failure is consumed
+        backend.set(SettingKey::Hostname, "gelbox").expect("set");
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("get"),
+            Some("gelbox".to_owned())
+        );
     }
 
     #[test]
