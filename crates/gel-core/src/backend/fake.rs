@@ -1,4 +1,10 @@
-use crate::{backend::PackageBackend, error::GelError, state::SystemState};
+use std::collections::HashMap;
+
+use crate::{
+    backend::{PackageBackend, file::FileBackend},
+    error::GelError,
+    state::SystemState,
+};
 
 /// A recorded backend operation, in the order it was invoked
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +17,10 @@ pub enum Call {
     InstallForeign(Vec<String>),
     /// `remove_foreign` was called with these packages
     RemoveForeign(Vec<String>),
+    /// `write_file` was called for this path
+    WriteFile(String),
+    /// `remove_file` was called for this path
+    RemoveFile(String),
 }
 
 /// An in-memory [`PackageBackend`] for tests
@@ -22,6 +32,7 @@ pub enum Call {
 pub struct FakeBackend {
     native: Vec<String>,
     foreign: Vec<String>,
+    files: HashMap<String, String>,
     calls: Vec<Call>,
     fail_on: Option<Call>,
 }
@@ -33,9 +44,25 @@ impl FakeBackend {
         Self {
             native: native.iter().map(|s| (*s).to_owned()).collect(),
             foreign: foreign.iter().map(|s| (*s).to_owned()).collect(),
-            calls: Vec::new(),
-            fail_on: None,
+            ..Self::default()
         }
+    }
+
+    /// Construct a backend seeded with the given files as `(path, content)` pairs
+    #[must_use]
+    pub fn with_files(files: &[(&str, &str)]) -> Self {
+        Self {
+            files: files
+                .iter()
+                .map(|(path, content)| ((*path).to_owned(), (*content).to_owned()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Seed or overwrite a single file's content without recording a call
+    pub fn set_file(&mut self, path: &str, content: &str) {
+        self.files.insert(path.to_owned(), content.to_owned());
     }
 
     /// Return the ordered log of mutating calls made against this backend
@@ -147,6 +174,34 @@ impl PackageBackend for FakeBackend {
     }
 }
 
+impl FileBackend for FakeBackend {
+    fn read_file(&self, path: &str) -> Result<Option<String>, GelError> {
+        Ok(self.files.get(path).cloned())
+    }
+
+    fn write_file(&mut self, path: &str, content: &str) -> Result<(), GelError> {
+        let call = Call::WriteFile(path.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected write_file failure".to_owned()));
+        }
+        self.files.insert(path.to_owned(), content.to_owned());
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), GelError> {
+        let call = Call::RemoveFile(path.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected remove_file failure".to_owned()));
+        }
+        self.files.remove(path);
+        self.calls.push(call);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +230,87 @@ mod tests {
         assert_eq!(
             backend.calls(),
             &[Call::InstallNative(vec!["ripgrep".to_owned()])]
+        );
+    }
+
+    #[test]
+    fn read_file_is_none_until_written_then_some() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::default();
+
+        assert_eq!(backend.read_file("/etc/hostname").expect("read"), None);
+
+        backend
+            .write_file("/etc/hostname", "gelbox\n")
+            .expect("write");
+
+        assert_eq!(
+            backend.read_file("/etc/hostname").expect("read"),
+            Some("gelbox\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn remove_file_deletes_content() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/hostname", "gelbox\n")]);
+
+        backend.remove_file("/etc/hostname").expect("remove");
+
+        assert_eq!(backend.read_file("/etc/hostname").expect("read"), None);
+    }
+
+    #[test]
+    fn file_operations_are_recorded_in_order() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::default();
+
+        backend.write_file("/a", "one").expect("write");
+        backend.remove_file("/a").expect("remove");
+
+        assert_eq!(
+            backend.calls(),
+            &[
+                Call::WriteFile("/a".to_owned()),
+                Call::RemoveFile("/a".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn seeded_file_reads_back() {
+        use crate::backend::file::FileBackend;
+
+        let backend = FakeBackend::with_files(&[("/etc/motd", "hello\n")]);
+
+        assert_eq!(
+            backend.read_file("/etc/motd").expect("read"),
+            Some("hello\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn injected_write_failure_is_one_shot() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::default();
+        backend.set_fail_on(Call::WriteFile(String::new()));
+
+        // first matching write fails and does not mutate state
+        let first = backend.write_file("/etc/hostname", "gelbox\n");
+        assert!(first.is_err());
+        assert_eq!(backend.read_file("/etc/hostname").expect("read"), None);
+
+        // the next matching write succeeds now that the failure is consumed
+        backend
+            .write_file("/etc/hostname", "gelbox\n")
+            .expect("write");
+        assert_eq!(
+            backend.read_file("/etc/hostname").expect("read"),
+            Some("gelbox\n".to_owned())
         );
     }
 
