@@ -1,8 +1,8 @@
 use crate::{
-    backend::{PackageBackend, file::FileBackend},
+    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
     error::GelError,
-    journal::FileBackup,
-    plan::{Plan, plan_files},
+    journal::{FileBackup, ServiceBackup},
+    plan::{Plan, plan_files, plan_services},
     state::DesiredState,
 };
 
@@ -30,6 +30,8 @@ pub struct Applied {
     pub plan: Plan,
     /// Prior content of each file written, so the transaction can be rolled back
     pub file_backups: Vec<FileBackup>,
+    /// Prior enabled-state of each unit toggled, so it can be rolled back
+    pub service_backups: Vec<ServiceBackup>,
 }
 
 /// Reconcile a backend toward `desired`, returning what was applied
@@ -49,10 +51,17 @@ pub struct Applied {
 /// The written files populate `plan.file_writes` so the effective plan reflects
 /// them.
 ///
+/// After files, declared services converge: only units named in
+/// `desired.services` are considered (never a full-set prune), and for each unit
+/// that is not already in its declared state its prior enabled-state is read and
+/// recorded as a [`ServiceBackup`] before it is enabled or disabled, so the
+/// transaction can restore it. The toggled units populate `plan.service_enable`
+/// and `plan.service_disable` so the effective plan reflects them.
+///
 /// # Errors
 ///
 /// Returns [`GelError`] if any backend query or mutation fails.
-pub fn apply<B: PackageBackend + FileBackend>(
+pub fn apply<B: PackageBackend + FileBackend + ServiceBackend>(
     b: &mut B,
     desired: &DesiredState,
     opts: ApplyOpts,
@@ -92,16 +101,48 @@ pub fn apply<B: PackageBackend + FileBackend>(
     }
     plan.file_writes = writes;
 
-    Ok(Applied { plan, file_backups })
+    // converge declared services after files, capturing prior state per toggle.
+    // plan_services only returns units that are not already in their declared
+    // state, so every unit here genuinely changes and is worth backing up
+    let (enable, disable) = plan_services(b, desired)?;
+    let mut service_backups = Vec::with_capacity(enable.len() + disable.len());
+    for unit in &enable {
+        // read the prior enabled-state BEFORE toggling so rollback can restore it
+        let prior_enabled = b.is_enabled(unit)?;
+        b.enable(unit)?;
+        service_backups.push(ServiceBackup {
+            unit: unit.clone(),
+            prior_enabled,
+        });
+    }
+    for unit in &disable {
+        let prior_enabled = b.is_enabled(unit)?;
+        b.disable(unit)?;
+        service_backups.push(ServiceBackup {
+            unit: unit.clone(),
+            prior_enabled,
+        });
+    }
+    plan.service_enable = enable;
+    plan.service_disable = disable;
+
+    Ok(Applied {
+        plan,
+        file_backups,
+        service_backups,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        backend::{PackageBackend, fake::Call, fake::FakeBackend, file::FileBackend},
-        journal::FileBackup,
-        state::{DesiredState, ManagedFile},
+        backend::{
+            PackageBackend, fake::Call, fake::FakeBackend, file::FileBackend,
+            service::ServiceBackend,
+        },
+        journal::{FileBackup, ServiceBackup},
+        state::{DesiredState, ManagedFile, ServiceIntent},
     };
 
     fn desired_files(files: Vec<ManagedFile>) -> DesiredState {
@@ -109,7 +150,7 @@ mod tests {
             native: vec![],
             foreign: vec![],
             files,
-            services: crate::state::ServiceIntent::default(),
+            services: ServiceIntent::default(),
         }
     }
 
@@ -194,12 +235,122 @@ mod tests {
     }
 
     #[test]
-    fn full_apply_then_rollback_restores_files_and_inverts_packages() {
+    fn apply_enables_declared_disabled_unit_and_backs_up_prior() {
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                enable: vec!["sshd.service".to_owned()],
+                disable: vec![],
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the unit is now enabled on the backend
+        assert!(backend.is_enabled("sshd.service").expect("query"));
+        // its prior disabled state is recorded so rollback can restore it
+        assert_eq!(
+            applied.service_backups,
+            vec![ServiceBackup {
+                unit: "sshd.service".to_owned(),
+                prior_enabled: false,
+            }]
+        );
+        // the effective plan reflects the enable
+        assert_eq!(applied.plan.service_enable, vec!["sshd.service".to_owned()]);
+        assert!(applied.plan.service_disable.is_empty());
+        // the enable is observable in the call log
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::EnableService("sshd.service".to_owned()))
+        );
+    }
+
+    #[test]
+    fn apply_disables_declared_enabled_unit_and_backs_up_prior() {
+        // seed the unit enabled so the apply must disable it
+        let mut backend = FakeBackend::with_enabled(&["bluetooth.service"]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                enable: vec![],
+                disable: vec!["bluetooth.service".to_owned()],
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the unit is now disabled on the backend
+        assert!(!backend.is_enabled("bluetooth.service").expect("query"));
+        // its prior enabled state is recorded so rollback can restore it
+        assert_eq!(
+            applied.service_backups,
+            vec![ServiceBackup {
+                unit: "bluetooth.service".to_owned(),
+                prior_enabled: true,
+            }]
+        );
+        // the effective plan reflects the disable
+        assert_eq!(
+            applied.plan.service_disable,
+            vec!["bluetooth.service".to_owned()]
+        );
+        assert!(applied.plan.service_enable.is_empty());
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::DisableService("bluetooth.service".to_owned()))
+        );
+    }
+
+    #[test]
+    fn apply_skips_unit_already_in_desired_state() {
+        // sshd already enabled (declared enable), bluetooth already disabled
+        // (declared disable): neither should be touched
+        let mut backend = FakeBackend::with_enabled(&["sshd.service"]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                enable: vec!["sshd.service".to_owned()],
+                disable: vec!["bluetooth.service".to_owned()],
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // no unit changed, so no backups and an empty service plan
+        assert!(applied.service_backups.is_empty());
+        assert!(applied.plan.service_enable.is_empty());
+        assert!(applied.plan.service_disable.is_empty());
+        // and no enable/disable call was ever made
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::EnableService(_) | Call::DisableService(_)))
+        );
+    }
+
+    #[test]
+    fn full_apply_then_rollback_restores_files_services_and_inverts_packages() {
         use crate::journal::{JournalEntry, rollback_last, write_entry};
 
-        // start: git + vim installed, one pre-existing managed file with old content
+        // start: git + vim installed, one pre-existing managed file with old
+        // content, bluetooth enabled (to be disabled), sshd disabled (to be
+        // enabled)
         let mut backend = FakeBackend::with_explicit(&["git", "vim"], &[]);
         backend.set_file("/etc/changed", "old\n");
+        backend.enable("bluetooth.service").expect("seed enable");
+        // the seeding enable must not leak into the transaction call log below
+        let seeded_calls = backend.calls().len();
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec![],
@@ -213,12 +364,38 @@ mod tests {
                     content: "new\n".to_owned(),
                 },
             ],
-            services: crate::state::ServiceIntent::default(),
+            services: ServiceIntent {
+                enable: vec!["sshd.service".to_owned()],
+                disable: vec!["bluetooth.service".to_owned()],
+            },
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
 
-        // journal the effective plan together with the file backups
+        // the apply enabled sshd and disabled bluetooth, and recorded each prior
+        assert!(backend.is_enabled("sshd.service").expect("query"));
+        assert!(!backend.is_enabled("bluetooth.service").expect("query"));
+        assert_eq!(
+            applied.service_backups,
+            vec![
+                ServiceBackup {
+                    unit: "sshd.service".to_owned(),
+                    prior_enabled: false,
+                },
+                ServiceBackup {
+                    unit: "bluetooth.service".to_owned(),
+                    prior_enabled: true,
+                },
+            ]
+        );
+        // the transaction toggled exactly the two declared units
+        let toggles = backend.calls()[seeded_calls..]
+            .iter()
+            .filter(|c| matches!(c, Call::EnableService(_) | Call::DisableService(_)))
+            .count();
+        assert_eq!(toggles, 2);
+
+        // journal the effective plan together with the file and service backups
         let dir = tempfile::tempdir().expect("tempdir");
         let entry = JournalEntry {
             id: "tx-1".to_owned(),
@@ -226,6 +403,7 @@ mod tests {
             plan: applied.plan,
             snapshot: None,
             file_backups: applied.file_backups,
+            service_backups: applied.service_backups,
         };
         write_entry(dir.path(), &entry).expect("write");
 
@@ -244,6 +422,10 @@ mod tests {
         assert!(!state.native.contains(&"ripgrep".to_owned()));
         assert!(state.native.contains(&"git".to_owned()));
         assert!(state.native.contains(&"vim".to_owned()));
+        // services are restored to their prior state: the unit the transaction
+        // enabled is disabled again, the one it disabled is enabled again
+        assert!(!backend.is_enabled("sshd.service").expect("query"));
+        assert!(backend.is_enabled("bluetooth.service").expect("query"));
     }
 
     #[test]
@@ -319,6 +501,7 @@ mod tests {
             plan: applied.plan,
             snapshot: None,
             file_backups: applied.file_backups,
+            service_backups: applied.service_backups,
         };
         write_entry(dir.path(), &entry).expect("write");
 

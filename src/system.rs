@@ -146,6 +146,7 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
         plan: applied.plan,
         snapshot,
         file_backups: applied.file_backups,
+        service_backups: applied.service_backups,
     };
     journal::write_entry(&paths::journal_dir()?, &entry)
         .context("failed to record the transaction journal entry")?;

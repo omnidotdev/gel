@@ -27,11 +27,14 @@ pub enum Call {
     DisableService(String),
 }
 
-/// An in-memory [`PackageBackend`] for tests
+/// An in-memory backend for tests, implementing all three backend traits
 ///
-/// It holds native and foreign package sets, mutates them on install/remove,
-/// and records an ordered log of every mutating call so tests can assert both
-/// resulting state and the exact operations performed.
+/// It implements [`PackageBackend`], [`FileBackend`](crate::backend::file::FileBackend),
+/// and [`ServiceBackend`], holding native and foreign package sets, a map of
+/// managed files, and a map of unit enabled-states. It mutates them on
+/// install/remove, write/remove, and enable/disable, recording an ordered log of
+/// every mutating call so tests can assert both resulting state and the exact
+/// operations performed.
 #[derive(Debug, Default, Clone)]
 pub struct FakeBackend {
     native: Vec<String>,
