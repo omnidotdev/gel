@@ -16,7 +16,7 @@ use gel_core::{
     apply::{ApplyOpts, apply},
     backend::{PackageBackend, arch::ArchBackend},
     journal::{self, JournalEntry},
-    plan::{Plan, plan_files, plan_services},
+    plan::{Plan, plan_files, plan_services, plan_settings},
     snapshot::{SnapshotId, SnapshotProvider},
     snapshot_btrfs::BtrfsSnapshot,
     state::DesiredState,
@@ -66,6 +66,10 @@ pub fn diff(artifact: Option<PathBuf>) -> anyhow::Result<()> {
         plan_services(&backend, &desired).context("failed to plan service changes")?;
     plan.service_enable = service_enable;
     plan.service_disable = service_disable;
+    // surface setting changes; this reads current values but changes nothing, so
+    // diff stays read-only
+    plan.setting_changes =
+        plan_settings(&backend, &desired).context("failed to plan setting changes")?;
     render::print_plan(&plan);
     Ok(())
 }
@@ -140,6 +144,10 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
         plan_services(&backend, &desired).context("failed to plan service changes")?;
     preview.service_enable = service_enable;
     preview.service_disable = service_disable;
+    // include pending setting changes for the same reason: a settings-only change
+    // must be previewed and must not be treated as "nothing to apply"
+    preview.setting_changes =
+        plan_settings(&backend, &desired).context("failed to plan setting changes")?;
     render::print_plan(&preview);
     if preview.is_empty() {
         println!("system already matches the desired state; nothing to apply");
@@ -159,6 +167,7 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
         snapshot,
         file_backups: applied.file_backups,
         service_backups: applied.service_backups,
+        setting_backups: applied.setting_backups,
     };
     journal::write_entry(&paths::journal_dir()?, &entry)
         .context("failed to record the transaction journal entry")?;
@@ -168,8 +177,9 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
     let files = entry.plan.file_writes.len();
     let enabled = entry.plan.service_enable.len();
     let disabled = entry.plan.service_disable.len();
+    let settings = entry.plan.setting_changes.len();
     println!(
-        "applied: +{installed} installed, -{removed} removed, {files} files written, +{enabled} enabled, -{disabled} disabled"
+        "applied: +{installed} installed, -{removed} removed, {files} files written, +{enabled} enabled, -{disabled} disabled, {settings} settings changed"
     );
     Ok(())
 }
@@ -196,9 +206,10 @@ pub fn rollback() -> anyhow::Result<()> {
     let uninstall = plan.native_install.len() + plan.foreign_install.len();
     let files = latest.file_backups.len();
     let services = latest.service_backups.len();
+    let settings = latest.setting_backups.len();
     println!("rolling back transaction {}", latest.id);
     println!(
-        "+{reinstall} to reinstall, -{uninstall} to remove, {files} files to restore, {services} services to restore"
+        "+{reinstall} to reinstall, -{uninstall} to remove, {files} files to restore, {services} services to restore, {settings} settings to restore"
     );
 
     journal::rollback_last(&dir, &mut backend)
@@ -206,10 +217,11 @@ pub fn rollback() -> anyhow::Result<()> {
 
     println!("rolled back transaction {}", latest.id);
     // rollback reverses packages, restores gel-managed files to their prior
-    // content, and restores each touched unit's prior enabled state; a full
-    // snapshot-based filesystem restore is planned for later
+    // content, restores each touched unit's prior enabled state, and restores each
+    // changed setting to its prior value; a full snapshot-based filesystem restore
+    // is planned for later
     println!(
-        "note: this reverses packages, restores managed files, and restores prior service enabled state; snapshot-based filesystem restore is planned for a later phase"
+        "note: this reverses packages, restores managed files, restores prior service enabled state, and restores prior settings; snapshot-based filesystem restore is planned for a later phase"
     );
     Ok(())
 }
