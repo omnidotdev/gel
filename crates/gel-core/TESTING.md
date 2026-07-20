@@ -26,8 +26,17 @@ is safe (it only runs cargo and writes a file, never touching packages):
 
 ```bash
 gel eval examples/host-config --out /tmp/desired.json
-cat /tmp/desired.json   # a DesiredState: sorted, deduplicated native + foreign
+cat /tmp/desired.json   # a DesiredState: sorted native + foreign, plus managed files
 ```
+
+The example config declares one illustrative managed file
+(`/tmp/gel-demo.conf`) via `System::file`, so the emitted artifact carries a
+`files` entry. Managed-file behavior is covered end to end by pure unit tests
+(the `System` builder's sort/last-wins in `config.rs`, `plan_files` in `plan.rs`,
+`apply`'s read-before-write backups in `apply.rs`, and `rollback_last`'s
+restore/delete in `journal.rs`); the real filesystem writes live behind the
+`arch` feature and are exercised only in the container or by hand, never against
+a developer host.
 
 The real Arch backend (`ArchBackend`) and btrfs snapshot provider
 (`BtrfsSnapshot`) route all process execution through a `CommandRunner` seam, so

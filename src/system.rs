@@ -16,7 +16,7 @@ use gel_core::{
     apply::{ApplyOpts, apply},
     backend::{PackageBackend, arch::ArchBackend},
     journal::{self, JournalEntry},
-    plan::Plan,
+    plan::{Plan, plan_files},
     snapshot::{SnapshotId, SnapshotProvider},
     snapshot_btrfs::BtrfsSnapshot,
     state::DesiredState,
@@ -56,7 +56,10 @@ pub fn diff(artifact: Option<PathBuf>) -> anyhow::Result<()> {
     let current = backend
         .query_explicit()
         .context("failed to query current package state")?;
-    let plan = Plan::compute(&current, &desired);
+    let mut plan = Plan::compute(&current, &desired);
+    // surface managed file writes alongside the package plan; this reads current
+    // file content but writes nothing, so diff stays read-only
+    plan.file_writes = plan_files(&backend, &desired).context("failed to plan managed files")?;
     render::print_plan(&plan);
     Ok(())
 }
@@ -122,6 +125,9 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
         preview.native_remove.clear();
         preview.foreign_remove.clear();
     }
+    // include pending file writes so the preview mentions them and the
+    // already-converged short-circuit below does not skip a needed file write
+    preview.file_writes = plan_files(&backend, &desired).context("failed to plan managed files")?;
     render::print_plan(&preview);
     if preview.is_empty() {
         println!("system already matches the desired state; nothing to apply");

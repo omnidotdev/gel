@@ -26,10 +26,13 @@ fn run_gel(args: &[&str]) -> (bool, String) {
 #[test]
 fn system_commands_fast_fail_without_arch_feature() {
     // each system-touching subcommand must exit non-zero with the rebuild hint
-    // and must not touch the host; a plain `cargo test` builds the pure binary
+    // and must not touch the host; a plain `cargo test` builds the pure binary.
+    // diff and apply now also plan managed file writes, but that work lives
+    // behind the arch feature, so they must still fast-fail before any planning
     for args in [
         vec!["diff"],
         vec!["apply"],
+        vec!["apply", "--prune"],
         vec!["import"],
         vec!["rollback"],
     ] {

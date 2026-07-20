@@ -52,13 +52,31 @@ use gel_core::config::System;
 fn main() {
     let system = System::new()
         .native(["git", "ripgrep", "fd", "bat"]) // official-repo packages (pacman)
-        .foreign(["paru"]); // AUR packages (AUR helper)
+        .foreign(["paru"]) // AUR packages (AUR helper)
+        // a managed file: gel writes this content verbatim on apply
+        .file("/tmp/gel-demo.conf", "greeting = hello\n");
     print!("{}", serde_json::to_string(&system.build()).expect("serialize"));
 }
 ```
 
-`System::build()` sorts and deduplicates each list, so authoring order does not
-matter.
+`System::build()` sorts and deduplicates each package list, so authoring order
+does not matter. Managed files are likewise sorted by path and deduplicated by
+path; declaring the same path twice is last-wins (the final content is kept).
+
+### Managed files
+
+`System::file(path, content)` declares a file whose full content gel owns. On
+`apply`, gel writes each declared file whose content differs from what is on disk
+(creating parent directories as needed) and records the prior content, so
+`rollback` restores it: a file gel created is deleted, and a file gel overwrote
+is returned to its exact prior bytes. Writes are atomic (written to a temp
+sibling then renamed into place), so a crash mid-write cannot leave a partially
+written config.
+
+Not yet handled (planned for later phases): file pruning (removing a file just
+because it left the config), file permissions and ownership, content templating,
+and drift detection against package-provided default config files. gel manages
+only the files you declare, by full content.
 
 ### 2. Evaluate (pure, always available)
 
@@ -74,17 +92,20 @@ gel eval examples/host-config --out /tmp/desired.json
 ### 3. Diff and apply (require an Arch build)
 
 ```sh
-gel diff                 # preview the plan: +N to install, -N to remove (read-only)
-gel apply                # additive converge: install what is missing
+gel diff                 # preview the plan: +N to install, -N to remove, ~N files (read-only)
+gel apply                # additive converge: install what is missing, write managed files
 gel apply --prune        # also remove explicit packages absent from the config
 gel import               # capture the current explicit packages as a desired state
-gel rollback             # invert the most recent apply at the package level
+gel rollback             # invert the most recent apply (packages + managed files)
 ```
 
-`apply` takes a filesystem snapshot first (via snapper on btrfs; it degrades to a
-warning when snapshots are unavailable), prints the plan, converges, and records a
-transaction in the journal so it can be rolled back. `rollback` reverses packages
-only; snapshot-based filesystem restore is planned for a later phase.
+`diff` also lists the managed files whose content would change (`~N files to
+write` plus each target path) and stays read-only. `apply` takes a filesystem
+snapshot first (via snapper on btrfs; it degrades to a warning when snapshots are
+unavailable), prints the plan, converges packages, writes managed files, and
+records a transaction in the journal so it can be rolled back. `rollback` reverses
+packages and restores managed files to their prior content; a full snapshot-based
+filesystem restore is planned for a later phase.
 
 ### The `arch` feature
 

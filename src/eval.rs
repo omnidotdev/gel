@@ -61,9 +61,10 @@ pub fn run(dir: &Path, out: Option<PathBuf>) -> anyhow::Result<()> {
         .with_context(|| format!("failed to write artifact to {}", artifact.display()))?;
 
     println!(
-        "evaluated config: {} native, {} foreign -> {}",
+        "evaluated config: {} native, {} foreign, {} files -> {}",
         desired.native.len(),
         desired.foreign.len(),
+        desired.files.len(),
         artifact.display()
     );
     Ok(())

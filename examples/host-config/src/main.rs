@@ -12,7 +12,14 @@ fn main() {
         // native (official-repo) packages, managed with pacman
         .native(["git", "ripgrep", "fd", "bat"])
         // foreign (AUR) packages, managed with an AUR helper
-        .foreign(["paru"]);
+        .foreign(["paru"])
+        // a managed file: gel writes this content verbatim on apply and restores
+        // the prior content on rollback. The path here is deliberately a harmless
+        // demo file; point it at a real dotfile to manage one for real
+        .file(
+            "/tmp/gel-demo.conf",
+            "# managed by gel; edit examples/host-config to change\ngreeting = hello\n",
+        );
 
     // print the desired state as JSON on stdout for `gel eval` to capture
     let json = serde_json::to_string(&system.build()).expect("serialize desired state");
