@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    backend::{PackageBackend, file::FileBackend},
+    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
     error::GelError,
     state::SystemState,
 };
@@ -21,6 +21,10 @@ pub enum Call {
     WriteFile(String),
     /// `remove_file` was called for this path
     RemoveFile(String),
+    /// `enable` was called for this unit
+    EnableService(String),
+    /// `disable` was called for this unit
+    DisableService(String),
 }
 
 /// An in-memory [`PackageBackend`] for tests
@@ -33,6 +37,7 @@ pub struct FakeBackend {
     native: Vec<String>,
     foreign: Vec<String>,
     files: HashMap<String, String>,
+    services: HashMap<String, bool>,
     calls: Vec<Call>,
     fail_on: Option<Call>,
 }
@@ -56,6 +61,15 @@ impl FakeBackend {
                 .iter()
                 .map(|(path, content)| ((*path).to_owned(), (*content).to_owned()))
                 .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Construct a backend seeded with the given units marked enabled
+    #[must_use]
+    pub fn with_enabled(units: &[&str]) -> Self {
+        Self {
+            services: units.iter().map(|u| ((*u).to_owned(), true)).collect(),
             ..Self::default()
         }
     }
@@ -203,6 +217,35 @@ impl FileBackend for FakeBackend {
     }
 }
 
+impl ServiceBackend for FakeBackend {
+    fn is_enabled(&self, unit: &str) -> Result<bool, GelError> {
+        // An unknown unit is treated as not enabled
+        Ok(self.services.get(unit).copied().unwrap_or(false))
+    }
+
+    fn enable(&mut self, unit: &str) -> Result<(), GelError> {
+        let call = Call::EnableService(unit.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected enable failure".to_owned()));
+        }
+        self.services.insert(unit.to_owned(), true);
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn disable(&mut self, unit: &str) -> Result<(), GelError> {
+        let call = Call::DisableService(unit.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected disable failure".to_owned()));
+        }
+        self.services.insert(unit.to_owned(), false);
+        self.calls.push(call);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +356,72 @@ mod tests {
             backend.read_file("/etc/hostname").expect("read"),
             Some("gelbox\n".to_owned())
         );
+    }
+
+    #[test]
+    fn enable_flips_state_and_records_call() {
+        use crate::backend::service::ServiceBackend;
+
+        let mut backend = FakeBackend::default();
+
+        backend.enable("sshd.service").expect("enable");
+
+        assert!(backend.is_enabled("sshd.service").expect("query"));
+        assert_eq!(
+            backend.calls(),
+            &[Call::EnableService("sshd.service".to_owned())]
+        );
+    }
+
+    #[test]
+    fn disable_flips_state_and_records_call() {
+        use crate::backend::service::ServiceBackend;
+
+        let mut backend = FakeBackend::with_enabled(&["bluetooth.service"]);
+
+        backend.disable("bluetooth.service").expect("disable");
+
+        assert!(!backend.is_enabled("bluetooth.service").expect("query"));
+        assert_eq!(
+            backend.calls(),
+            &[Call::DisableService("bluetooth.service".to_owned())]
+        );
+    }
+
+    #[test]
+    fn unknown_unit_is_not_enabled() {
+        use crate::backend::service::ServiceBackend;
+
+        let backend = FakeBackend::default();
+
+        assert!(!backend.is_enabled("unknown.service").expect("query"));
+    }
+
+    #[test]
+    fn seeded_units_read_back_as_enabled() {
+        use crate::backend::service::ServiceBackend;
+
+        let backend = FakeBackend::with_enabled(&["sshd.service", "docker.service"]);
+
+        assert!(backend.is_enabled("sshd.service").expect("query"));
+        assert!(backend.is_enabled("docker.service").expect("query"));
+    }
+
+    #[test]
+    fn injected_enable_failure_is_one_shot() {
+        use crate::backend::service::ServiceBackend;
+
+        let mut backend = FakeBackend::default();
+        backend.set_fail_on(Call::EnableService(String::new()));
+
+        // first matching enable fails and does not mutate state
+        let first = backend.enable("sshd.service");
+        assert!(first.is_err());
+        assert!(!backend.is_enabled("sshd.service").expect("query"));
+
+        // the next matching enable succeeds now that the failure is consumed
+        backend.enable("sshd.service").expect("enable");
+        assert!(backend.is_enabled("sshd.service").expect("query"));
     }
 
     #[test]

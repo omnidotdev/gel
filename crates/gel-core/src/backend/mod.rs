@@ -1,6 +1,7 @@
 use crate::{error::GelError, state::SystemState};
 
 pub mod file;
+pub mod service;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake;
