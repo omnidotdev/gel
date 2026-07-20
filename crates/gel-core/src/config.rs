@@ -23,6 +23,7 @@ pub struct System {
     files: Vec<ManagedFile>,
     enable: Vec<String>,
     disable: Vec<String>,
+    settings: SettingsIntent,
 }
 
 impl System {
@@ -89,6 +90,36 @@ impl System {
         self
     }
 
+    /// Declare the desired hostname
+    ///
+    /// Chainable and last-call-wins: the final call sets the managed hostname.
+    /// A hostname left unset is one gel never touches (see [`SettingsIntent`]).
+    #[must_use]
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.settings.hostname = Some(hostname.into());
+        self
+    }
+
+    /// Declare the desired system timezone
+    ///
+    /// Chainable and last-call-wins: the final call sets the managed timezone.
+    /// A timezone left unset is one gel never touches (see [`SettingsIntent`]).
+    #[must_use]
+    pub fn timezone(mut self, timezone: impl Into<String>) -> Self {
+        self.settings.timezone = Some(timezone.into());
+        self
+    }
+
+    /// Declare the desired system locale
+    ///
+    /// Chainable and last-call-wins: the final call sets the managed locale.
+    /// A locale left unset is one gel never touches (see [`SettingsIntent`]).
+    #[must_use]
+    pub fn locale(mut self, locale: impl Into<String>) -> Self {
+        self.settings.locale = Some(locale.into());
+        self
+    }
+
     /// Lower the accumulated configuration into a [`DesiredState`]
     ///
     /// Each package origin is sorted and deduplicated so that authoring order and
@@ -105,6 +136,11 @@ impl System {
     /// list so the built state never carries a unit in both lists. This mirrors
     /// the planner's disable-wins conflict rule, so an ambiguous declaration can
     /// never leave a unit enabled.
+    ///
+    /// System settings (hostname, timezone, locale) are carried through as
+    /// declared. Each is last-call-wins per field, so only the final value for a
+    /// field survives; a field never set stays `None`, meaning gel leaves it
+    /// unmanaged.
     #[must_use]
     pub fn build(self) -> DesiredState {
         DesiredState {
@@ -112,7 +148,7 @@ impl System {
             foreign: sorted_unique(self.foreign),
             files: sorted_unique_files(self.files),
             services: build_services(self.enable, self.disable),
-            settings: SettingsIntent::default(),
+            settings: self.settings,
         }
     }
 }
@@ -383,5 +419,100 @@ mod tests {
             desired.services.disable,
             vec!["bluetooth.service".to_owned()]
         );
+    }
+
+    #[test]
+    fn each_setting_setter_sets_its_field() {
+        let desired = System::new()
+            .hostname("gelbox")
+            .timezone("Etc/UTC")
+            .locale("en_US.UTF-8")
+            .build();
+
+        assert_eq!(
+            desired.settings,
+            SettingsIntent {
+                hostname: Some("gelbox".to_owned()),
+                timezone: Some("Etc/UTC".to_owned()),
+                locale: Some("en_US.UTF-8".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn unset_settings_stay_none() {
+        // only hostname is declared; the others must remain unmanaged
+        let desired = System::new().hostname("gelbox").build();
+
+        assert_eq!(desired.settings.hostname, Some("gelbox".to_owned()));
+        assert!(desired.settings.timezone.is_none());
+        assert!(desired.settings.locale.is_none());
+    }
+
+    #[test]
+    fn no_setting_setters_leaves_all_none() {
+        let desired = System::new().native(["git"]).build();
+
+        assert_eq!(desired.settings, SettingsIntent::default());
+    }
+
+    #[test]
+    fn setting_setters_are_last_call_wins_per_field() {
+        // the final call for each field is the one that survives, independently
+        let desired = System::new()
+            .hostname("first")
+            .hostname("second")
+            .timezone("Etc/UTC")
+            .timezone("America/New_York")
+            .build();
+
+        assert_eq!(desired.settings.hostname, Some("second".to_owned()));
+        assert_eq!(
+            desired.settings.timezone,
+            Some("America/New_York".to_owned())
+        );
+        // locale was never set, so it stays unmanaged
+        assert!(desired.settings.locale.is_none());
+    }
+
+    #[test]
+    fn setting_setters_accept_both_str_and_string() {
+        // each setter is generic over Into<String>, so &str and String mix
+        let desired = System::new()
+            .hostname("gelbox".to_owned())
+            .timezone("Etc/UTC")
+            .locale("en_US.UTF-8".to_owned())
+            .build();
+
+        assert_eq!(desired.settings.hostname, Some("gelbox".to_owned()));
+        assert_eq!(desired.settings.timezone, Some("Etc/UTC".to_owned()));
+        assert_eq!(desired.settings.locale, Some("en_US.UTF-8".to_owned()));
+    }
+
+    #[test]
+    fn settings_mix_with_packages_files_and_services() {
+        // settings accumulate independently and land in the state alongside the
+        // rest of the configuration
+        let desired = System::new()
+            .native(["git"])
+            .foreign(["yay"])
+            .file("/etc/motd", "hi\n")
+            .enable("sshd.service")
+            .disable("bluetooth.service")
+            .hostname("gelbox")
+            .timezone("Etc/UTC")
+            .build();
+
+        assert_eq!(desired.native, vec!["git".to_owned()]);
+        assert_eq!(desired.foreign, vec!["yay".to_owned()]);
+        assert_eq!(desired.files.len(), 1);
+        assert_eq!(desired.services.enable, vec!["sshd.service".to_owned()]);
+        assert_eq!(
+            desired.services.disable,
+            vec!["bluetooth.service".to_owned()]
+        );
+        assert_eq!(desired.settings.hostname, Some("gelbox".to_owned()));
+        assert_eq!(desired.settings.timezone, Some("Etc/UTC".to_owned()));
+        assert!(desired.settings.locale.is_none());
     }
 }
