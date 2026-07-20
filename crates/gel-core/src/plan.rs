@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    backend::{file::FileBackend, service::ServiceBackend},
+    backend::{file::FileBackend, service::ServiceBackend, settings::SettingsBackend},
     error::GelError,
-    state::{DesiredState, ManagedFile},
+    state::{DesiredState, ManagedFile, SettingKey},
 };
 
 /// A deterministic set of package and file changes to reconcile current with desired
@@ -20,6 +20,11 @@ pub struct Plan {
     /// Defaulted so journal entries predating the service model still deserialize
     #[serde(default)]
     pub service_disable: Vec<String>,
+    /// Settings to change, as `(key, desired value)` pairs
+    ///
+    /// Defaulted so journal entries predating the settings model still deserialize
+    #[serde(default)]
+    pub setting_changes: Vec<(SettingKey, String)>,
 }
 
 impl Plan {
@@ -42,6 +47,9 @@ impl Plan {
             // they are planned separately via `plan_services`
             service_enable: Vec::new(),
             service_disable: Vec::new(),
+            // Setting changes require reading current values, which is impure, so
+            // they are planned separately via `plan_settings`
+            setting_changes: Vec::new(),
         }
     }
 
@@ -55,6 +63,7 @@ impl Plan {
             && self.file_writes.is_empty()
             && self.service_enable.is_empty()
             && self.service_disable.is_empty()
+            && self.setting_changes.is_empty()
     }
 }
 
@@ -129,6 +138,36 @@ pub fn plan_services(
     Ok((sorted_unique(enable), sorted_unique(disable)))
 }
 
+/// Compute the setting changes needed to reach `desired`
+///
+/// Returns the declared settings whose current value differs from the desired
+/// value, as `(key, desired value)` pairs. A setting is included when it is
+/// unset or unreadable on the backend, or when its current value differs; a
+/// setting already equal to the desired value is skipped. Results follow the
+/// deterministic order of [`SettingsIntent::declared`](crate::state::SettingsIntent::declared)
+/// (Hostname, Timezone, Locale) so the plan is reproducible.
+///
+/// This is explicit-intent planning, not full-set convergence: only settings
+/// named in `desired.settings` are ever considered, so a setting gel was not
+/// told about is left untouched.
+///
+/// # Errors
+///
+/// Returns [`GelError`] if the backend fails to read a setting.
+pub fn plan_settings(
+    backend: &impl SettingsBackend,
+    desired: &DesiredState,
+) -> Result<Vec<(SettingKey, String)>, GelError> {
+    let mut changes = Vec::new();
+    for (key, value) in desired.settings.declared() {
+        let current = backend.get(key)?;
+        if current.as_deref() != Some(value.as_str()) {
+            changes.push((key, value));
+        }
+    }
+    Ok(changes)
+}
+
 /// Sort a list of units and drop duplicates
 fn sorted_unique(units: Vec<String>) -> Vec<String> {
     units
@@ -154,8 +193,18 @@ mod tests {
     use super::*;
     use crate::{
         backend::fake::FakeBackend,
-        state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent},
+        state::{DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent},
     };
+
+    fn desired_with_settings(settings: SettingsIntent) -> DesiredState {
+        DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent::default(),
+            settings,
+        }
+    }
 
     fn desired_with_files(files: Vec<ManagedFile>) -> DesiredState {
         DesiredState {
@@ -422,5 +471,90 @@ mod tests {
             ..Plan::default()
         };
         assert!(!disable_plan.is_empty());
+    }
+
+    #[test]
+    fn declared_setting_matching_current_is_excluded() {
+        let backend = FakeBackend::with_settings(&[(SettingKey::Hostname, "gelbox")]);
+        let desired = desired_with_settings(SettingsIntent {
+            hostname: Some("gelbox".to_owned()),
+            ..SettingsIntent::default()
+        });
+
+        let changes = plan_settings(&backend, &desired).expect("plan");
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn declared_setting_differing_from_current_is_included() {
+        let backend = FakeBackend::with_settings(&[(SettingKey::Hostname, "old")]);
+        let desired = desired_with_settings(SettingsIntent {
+            hostname: Some("gelbox".to_owned()),
+            ..SettingsIntent::default()
+        });
+
+        let changes = plan_settings(&backend, &desired).expect("plan");
+
+        assert_eq!(changes, vec![(SettingKey::Hostname, "gelbox".to_owned())]);
+    }
+
+    #[test]
+    fn declared_setting_unset_on_backend_is_included() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_settings(SettingsIntent {
+            timezone: Some("UTC".to_owned()),
+            ..SettingsIntent::default()
+        });
+
+        let changes = plan_settings(&backend, &desired).expect("plan");
+
+        assert_eq!(changes, vec![(SettingKey::Timezone, "UTC".to_owned())]);
+    }
+
+    #[test]
+    fn undeclared_settings_never_appear() {
+        // The backend carries a timezone gel was not told to manage, so it must
+        // never surface as a change
+        let backend = FakeBackend::with_settings(&[(SettingKey::Timezone, "UTC")]);
+        let desired = desired_with_settings(SettingsIntent {
+            hostname: Some("gelbox".to_owned()),
+            ..SettingsIntent::default()
+        });
+
+        let changes = plan_settings(&backend, &desired).expect("plan");
+
+        assert_eq!(changes, vec![(SettingKey::Hostname, "gelbox".to_owned())]);
+    }
+
+    #[test]
+    fn setting_changes_are_ordered_hostname_timezone_locale() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_settings(SettingsIntent {
+            hostname: Some("gelbox".to_owned()),
+            timezone: Some("UTC".to_owned()),
+            locale: Some("en_US.UTF-8".to_owned()),
+        });
+
+        let changes = plan_settings(&backend, &desired).expect("plan");
+
+        assert_eq!(
+            changes,
+            vec![
+                (SettingKey::Hostname, "gelbox".to_owned()),
+                (SettingKey::Timezone, "UTC".to_owned()),
+                (SettingKey::Locale, "en_US.UTF-8".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn setting_changes_count_toward_is_empty() {
+        let plan = Plan {
+            setting_changes: vec![(SettingKey::Hostname, "gelbox".to_owned())],
+            ..Plan::default()
+        };
+
+        assert!(!plan.is_empty());
     }
 }
