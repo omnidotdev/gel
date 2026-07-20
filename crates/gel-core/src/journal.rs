@@ -216,6 +216,7 @@ mod tests {
                 native_remove: vec!["vim".to_owned()],
                 foreign_install: vec!["yay".to_owned()],
                 foreign_remove: vec!["old-aur".to_owned()],
+                ..Plan::default()
             },
         );
         write_entry(dir.path(), &recorded).expect("write");
