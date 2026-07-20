@@ -6,9 +6,9 @@
 //! or clock access lives here, so a user config crate can depend on it and be
 //! evaluated deterministically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::state::{DesiredState, ManagedFile};
+use crate::state::{DesiredState, ManagedFile, ServiceIntent};
 
 /// Accumulates the native and foreign packages a machine should have
 ///
@@ -21,6 +21,8 @@ pub struct System {
     native: Vec<String>,
     foreign: Vec<String>,
     files: Vec<ManagedFile>,
+    enable: Vec<String>,
+    disable: Vec<String>,
 }
 
 impl System {
@@ -66,6 +68,27 @@ impl System {
         self
     }
 
+    /// Declare that `unit` should be enabled
+    ///
+    /// Chainable and order-independent. Repeats are collapsed by [`System::build`].
+    /// A unit named in both [`System::enable`] and [`System::disable`] resolves to
+    /// disable-only in the built state (see [`System::build`]).
+    #[must_use]
+    pub fn enable(mut self, unit: impl Into<String>) -> Self {
+        self.enable.push(unit.into());
+        self
+    }
+
+    /// Declare that `unit` should be disabled
+    ///
+    /// Chainable and order-independent. Repeats are collapsed by [`System::build`].
+    /// Disable wins over a conflicting [`System::enable`] for the same unit.
+    #[must_use]
+    pub fn disable(mut self, unit: impl Into<String>) -> Self {
+        self.disable.push(unit.into());
+        self
+    }
+
     /// Lower the accumulated configuration into a [`DesiredState`]
     ///
     /// Each package origin is sorted and deduplicated so that authoring order and
@@ -76,15 +99,36 @@ impl System {
     /// Managed files are likewise sorted by path and deduplicated by path so the
     /// result is deterministic. Deduplication is last-wins: when a path is
     /// declared more than once, the content of the final declaration is kept.
+    ///
+    /// Service intent is sorted and deduplicated per list. When a unit is named in
+    /// both enable and disable, **disable wins**: it is dropped from the enable
+    /// list so the built state never carries a unit in both lists. This mirrors
+    /// the planner's disable-wins conflict rule, so an ambiguous declaration can
+    /// never leave a unit enabled.
     #[must_use]
     pub fn build(self) -> DesiredState {
         DesiredState {
             native: sorted_unique(self.native),
             foreign: sorted_unique(self.foreign),
             files: sorted_unique_files(self.files),
-            services: crate::state::ServiceIntent::default(),
+            services: build_services(self.enable, self.disable),
         }
     }
+}
+
+/// Lower accumulated enable/disable declarations into a [`ServiceIntent`]
+///
+/// Each list is sorted and deduplicated, and disable wins over a conflicting
+/// enable: a unit present in both lists is removed from enable so the result
+/// never names a unit in both.
+fn build_services(enable: Vec<String>, disable: Vec<String>) -> ServiceIntent {
+    let disable = sorted_unique(disable);
+    let disable_set: BTreeSet<&String> = disable.iter().collect();
+    let enable = sorted_unique(enable)
+        .into_iter()
+        .filter(|unit| !disable_set.contains(unit))
+        .collect();
+    ServiceIntent { enable, disable }
 }
 
 /// Sort a package list and drop duplicates
@@ -248,5 +292,94 @@ mod tests {
             .build();
 
         assert_eq!(desired.files.len(), 2);
+    }
+
+    #[test]
+    fn enable_and_disable_declarations_are_accumulated() {
+        let desired = System::new()
+            .enable("sshd.service")
+            .disable("bluetooth.service")
+            .build();
+
+        assert_eq!(desired.services.enable, vec!["sshd.service".to_owned()]);
+        assert_eq!(
+            desired.services.disable,
+            vec!["bluetooth.service".to_owned()]
+        );
+    }
+
+    #[test]
+    fn build_sorts_and_deduplicates_each_service_list() {
+        // authoring order and accidental repeats must not affect the result
+        let desired = System::new()
+            .enable("c.service")
+            .enable("a.service")
+            .enable("a.service")
+            .disable("d.service")
+            .disable("b.service")
+            .disable("b.service")
+            .build();
+
+        assert_eq!(
+            desired.services.enable,
+            vec!["a.service".to_owned(), "c.service".to_owned()]
+        );
+        assert_eq!(
+            desired.services.disable,
+            vec!["b.service".to_owned(), "d.service".to_owned()]
+        );
+    }
+
+    #[test]
+    fn build_resolves_enable_disable_conflict_disable_wins() {
+        // a unit both enabled and disabled must end up only in disable, never
+        // in both lists, matching the planner's disable-wins rule
+        let desired = System::new()
+            .enable("conflict.service")
+            .disable("conflict.service")
+            .build();
+
+        assert!(desired.services.enable.is_empty());
+        assert_eq!(
+            desired.services.disable,
+            vec!["conflict.service".to_owned()]
+        );
+    }
+
+    #[test]
+    fn services_mix_with_packages_and_files() {
+        // services accumulate independently and land in the state alongside the
+        // rest of the configuration
+        let desired = System::new()
+            .native(["git"])
+            .foreign(["yay"])
+            .file("/etc/hostname", "gelbox\n")
+            .enable("sshd.service")
+            .disable("bluetooth.service")
+            .build();
+
+        assert_eq!(desired.native, vec!["git".to_owned()]);
+        assert_eq!(desired.foreign, vec!["yay".to_owned()]);
+        assert_eq!(desired.files.len(), 1);
+        assert_eq!(desired.services.enable, vec!["sshd.service".to_owned()]);
+        assert_eq!(
+            desired.services.disable,
+            vec!["bluetooth.service".to_owned()]
+        );
+    }
+
+    #[test]
+    fn enable_and_disable_accept_both_str_and_string() {
+        // enable/disable are generic over Into<String>, so &str and String mix
+        let desired = System::new()
+            .enable("sshd.service".to_owned())
+            .disable("bluetooth.service")
+            .build();
+
+        assert_eq!(desired.services.enable, vec!["sshd.service".to_owned()]);
+        assert_eq!(
+            desired.services.disable,
+            vec!["bluetooth.service".to_owned()]
+        );
     }
 }
