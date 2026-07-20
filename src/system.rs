@@ -131,21 +131,23 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // take a pre-apply snapshot, degrading gracefully when unavailable
     let snapshot = take_snapshot(&id);
 
-    let effective = apply(&mut backend, &desired, ApplyOpts { prune })
+    let applied = apply(&mut backend, &desired, ApplyOpts { prune })
         .context("failed to apply the desired state")?;
 
     let entry = JournalEntry {
         id,
         timestamp,
-        plan: effective,
+        plan: applied.plan,
         snapshot,
+        file_backups: applied.file_backups,
     };
     journal::write_entry(&paths::journal_dir()?, &entry)
         .context("failed to record the transaction journal entry")?;
 
     let installed = entry.plan.native_install.len() + entry.plan.foreign_install.len();
     let removed = entry.plan.native_remove.len() + entry.plan.foreign_remove.len();
-    println!("applied: +{installed} installed, -{removed} removed");
+    let files = entry.plan.file_writes.len();
+    println!("applied: +{installed} installed, -{removed} removed, {files} files written");
     Ok(())
 }
 
@@ -169,16 +171,18 @@ pub fn rollback() -> anyhow::Result<()> {
     let plan = &latest.plan;
     let reinstall = plan.native_remove.len() + plan.foreign_remove.len();
     let uninstall = plan.native_install.len() + plan.foreign_install.len();
+    let files = latest.file_backups.len();
     println!("rolling back transaction {}", latest.id);
-    println!("+{reinstall} to reinstall, -{uninstall} to remove");
+    println!("+{reinstall} to reinstall, -{uninstall} to remove, {files} files to restore");
 
     journal::rollback_last(&dir, &mut backend)
         .context("failed to roll back the last transaction")?;
 
     println!("rolled back transaction {}", latest.id);
-    // phase 1 rollback is package-level only; filesystem restore comes later
+    // rollback reverses packages and restores gel-managed files to their prior
+    // content; a full snapshot-based filesystem restore is planned for later
     println!(
-        "note: this reverses packages only; snapshot-based filesystem restore is planned for a later phase"
+        "note: this reverses packages and restores managed files; snapshot-based filesystem restore is planned for a later phase"
     );
     Ok(())
 }
