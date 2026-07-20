@@ -1,7 +1,7 @@
 //! Real Arch Linux package backend
 //!
 //! Compiled only with the `arch` feature. It drives `pacman` for native
-//! (official-repo) packages and an AUR helper (`paru` or `yay`) for foreign
+//! (official-repo) packages and the `paru` AUR helper for foreign
 //! packages, through a [`CommandRunner`] seam so the built argv is unit testable
 //! without touching the host.
 
@@ -19,13 +19,13 @@ use crate::{
     sys::{CommandRunner, SystemRunner},
 };
 
-/// AUR helpers to probe, in preference order
-const AUR_HELPERS: [&str; 2] = ["paru", "yay"];
+/// The AUR helper gel uses for foreign packages. Opinionated: paru only
+const PARU: &str = "paru";
 
 /// The real system package backend for Arch Linux
 ///
 /// Native packages are managed with `pacman`; foreign (AUR) packages are managed
-/// with the first available AUR helper. All process execution goes through a
+/// with `paru`. All process execution goes through a
 /// [`CommandRunner`] so the built argv can be asserted in tests.
 ///
 /// Package state is read by shelling out to `pacman -Qq*`. A future optimization
@@ -52,14 +52,15 @@ impl<R: CommandRunner> ArchBackend<R> {
         Self { runner }
     }
 
-    /// Locate the first available AUR helper
-    fn aur_helper(&self) -> Result<&'static str, GelError> {
-        AUR_HELPERS
-            .into_iter()
-            .find(|helper| self.runner.is_available(helper))
-            .ok_or_else(|| {
-                GelError::Backend("no AUR helper found (install paru or yay)".to_owned())
-            })
+    /// Ensure paru is available, since gel manages foreign packages with paru
+    fn ensure_paru(&self) -> Result<(), GelError> {
+        if self.runner.is_available(PARU) {
+            Ok(())
+        } else {
+            Err(GelError::Backend(
+                "paru not found; gel uses paru for AUR packages (install it, e.g. via scripts/bootstrap.sh --with-paru)".to_owned(),
+            ))
+        }
     }
 
     /// Query explicitly installed package names matching the given pacman args
@@ -168,16 +169,16 @@ impl<R: CommandRunner> PackageBackend for ArchBackend<R> {
         if pkgs.is_empty() {
             return Ok(());
         }
-        let helper = self.aur_helper()?;
-        self.run_checked(helper, &install_args(pkgs), "package installation")
+        self.ensure_paru()?;
+        self.run_checked(PARU, &install_args(pkgs), "package installation")
     }
 
     fn remove_foreign(&mut self, pkgs: &[String]) -> Result<(), GelError> {
         if pkgs.is_empty() {
             return Ok(());
         }
-        let helper = self.aur_helper()?;
-        self.run_checked(helper, &remove_args(pkgs), "package removal")
+        self.ensure_paru()?;
+        self.run_checked(PARU, &remove_args(pkgs), "package removal")
     }
 }
 
@@ -482,9 +483,8 @@ mod tests {
     }
 
     #[test]
-    fn install_foreign_uses_first_available_helper() {
-        // both present: paru is preferred over yay
-        let runner = MockRunner::new(true, "", "", &["paru", "yay"]);
+    fn install_foreign_uses_paru() {
+        let runner = MockRunner::new(true, "", "", &["paru"]);
         let mut backend = ArchBackend::with_runner(runner.clone());
 
         backend
@@ -501,19 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn install_foreign_falls_back_to_yay() {
-        let runner = MockRunner::new(true, "", "", &["yay"]);
-        let mut backend = ArchBackend::with_runner(runner.clone());
-
-        backend
-            .install_foreign(&owned(&["aur-pkg"]))
-            .expect("install");
-
-        assert_eq!(runner.calls()[0].0, "yay".to_owned());
-    }
-
-    #[test]
-    fn foreign_ops_error_without_helper() {
+    fn foreign_ops_error_without_paru() {
         let runner = MockRunner::new(true, "", "", &[]);
         let mut backend = ArchBackend::with_runner(runner.clone());
 
