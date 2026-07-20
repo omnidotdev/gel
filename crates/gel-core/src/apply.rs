@@ -142,7 +142,7 @@ mod tests {
             service::ServiceBackend,
         },
         journal::{FileBackup, ServiceBackup},
-        state::{DesiredState, ManagedFile, ServiceIntent},
+        state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent},
     };
 
     fn desired_files(files: Vec<ManagedFile>) -> DesiredState {
@@ -151,6 +151,7 @@ mod tests {
             foreign: vec![],
             files,
             services: ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         }
     }
 
@@ -245,6 +246,7 @@ mod tests {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec![],
             },
+            settings: SettingsIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -282,6 +284,7 @@ mod tests {
                 enable: vec![],
                 disable: vec!["bluetooth.service".to_owned()],
             },
+            settings: SettingsIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -322,6 +325,7 @@ mod tests {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec!["bluetooth.service".to_owned()],
             },
+            settings: SettingsIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -368,6 +372,7 @@ mod tests {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec!["bluetooth.service".to_owned()],
             },
+            settings: SettingsIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -436,6 +441,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -465,6 +471,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");
@@ -490,6 +497,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
 
@@ -529,6 +537,7 @@ mod tests {
             foreign: vec!["yay".to_owned()],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         let result = apply(&mut backend, &desired, ApplyOpts { prune: false });
@@ -557,6 +566,7 @@ mod tests {
             foreign: vec!["keep-aur".to_owned(), "new-aur".to_owned()],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::state::{DesiredState, ManagedFile, ServiceIntent};
+use crate::state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent};
 
 /// Accumulates the native and foreign packages a machine should have
 ///
@@ -112,6 +112,7 @@ impl System {
             foreign: sorted_unique(self.foreign),
             files: sorted_unique_files(self.files),
             services: build_services(self.enable, self.disable),
+            settings: SettingsIntent::default(),
         }
     }
 }
@@ -172,6 +173,7 @@ mod tests {
                 foreign: vec!["yay".to_owned()],
                 files: vec![],
                 services: crate::state::ServiceIntent::default(),
+                settings: crate::state::SettingsIntent::default(),
             }
         );
     }

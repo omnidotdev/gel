@@ -144,6 +144,7 @@ impl<R: CommandRunner> PackageBackend for ArchBackend<R> {
             foreign,
             files: Vec::new(),
             services: crate::state::ServiceIntent::default(),
+            settings: crate::state::SettingsIntent::default(),
         })
     }
 

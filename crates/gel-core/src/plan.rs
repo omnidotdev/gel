@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::{
         backend::fake::FakeBackend,
-        state::{DesiredState, ManagedFile, ServiceIntent},
+        state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent},
     };
 
     fn desired_with_files(files: Vec<ManagedFile>) -> DesiredState {
@@ -163,6 +163,7 @@ mod tests {
             foreign: vec![],
             files,
             services: ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         }
     }
 
@@ -175,6 +176,7 @@ mod tests {
                 enable: enable.iter().map(|s| (*s).to_owned()).collect(),
                 disable: disable.iter().map(|s| (*s).to_owned()).collect(),
             },
+            settings: SettingsIntent::default(),
         }
     }
 
@@ -261,12 +263,14 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec!["yay".to_owned()],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         let plan = Plan::compute(&current, &desired);
@@ -284,6 +288,7 @@ mod tests {
             foreign: vec!["yay".to_owned()],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         let plan = Plan::compute(&state, &state);
@@ -298,12 +303,14 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
         let desired = DesiredState {
             native: vec!["zsh".to_owned(), "bash".to_owned(), "bash".to_owned()],
             foreign: vec![],
             files: vec![],
             services: crate::state::ServiceIntent::default(),
+            settings: SettingsIntent::default(),
         };
 
         let plan = Plan::compute(&current, &desired);
