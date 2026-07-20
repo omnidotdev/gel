@@ -19,7 +19,12 @@ fn main() {
         .file(
             "/tmp/gel-demo.conf",
             "# managed by gel; edit examples/host-config to change\ngreeting = hello\n",
-        );
+        )
+        // a service intent: gel ensures this unit is enabled on apply and restores
+        // its prior enabled state on rollback. `systemd-timesyncd.service` is a
+        // stock systemd unit present on essentially every systemd host, so this is
+        // a harmless, illustrative demo; swap it for the units you actually manage
+        .enable("systemd-timesyncd.service");
 
     // print the desired state as JSON on stdout for `gel eval` to capture
     let json = serde_json::to_string(&system.build()).expect("serialize desired state");

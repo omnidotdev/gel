@@ -46,8 +46,9 @@ Locations (override the artifact with --out/--artifact):
 
 Arch support:
   import/diff/apply/rollback touch the system and require a build with
-  `--features arch`. `rollback` reverses packages only; snapshot-based
-  filesystem restore is planned for a later phase.";
+  `--features arch`. `rollback` reverses packages, managed files, and service
+  enable/disable state; snapshot-based filesystem restore is planned for a
+  later phase.";
 
 #[derive(Subcommand)]
 enum Command {

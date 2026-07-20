@@ -60,11 +60,13 @@ pub fn run(dir: &Path, out: Option<PathBuf>) -> anyhow::Result<()> {
     fs::write(&artifact, json)
         .with_context(|| format!("failed to write artifact to {}", artifact.display()))?;
 
+    let services = desired.services.enable.len() + desired.services.disable.len();
     println!(
-        "evaluated config: {} native, {} foreign, {} files -> {}",
+        "evaluated config: {} native, {} foreign, {} files, {} services -> {}",
         desired.native.len(),
         desired.foreign.len(),
         desired.files.len(),
+        services,
         artifact.display()
     );
     Ok(())

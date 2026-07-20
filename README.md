@@ -54,7 +54,9 @@ fn main() {
         .native(["git", "ripgrep", "fd", "bat"]) // official-repo packages (pacman)
         .foreign(["paru"]) // AUR packages (AUR helper)
         // a managed file: gel writes this content verbatim on apply
-        .file("/tmp/gel-demo.conf", "greeting = hello\n");
+        .file("/tmp/gel-demo.conf", "greeting = hello\n")
+        .enable("systemd-timesyncd.service") // ensure a unit is enabled
+        .disable("bluetooth.service"); // ensure a unit is disabled
     print!("{}", serde_json::to_string(&system.build()).expect("serialize"));
 }
 ```
@@ -62,6 +64,8 @@ fn main() {
 `System::build()` sorts and deduplicates each package list, so authoring order
 does not matter. Managed files are likewise sorted by path and deduplicated by
 path; declaring the same path twice is last-wins (the final content is kept).
+Service enable/disable lists are sorted and deduplicated too, with disable
+winning any enable/disable conflict for the same unit.
 
 ### Managed files
 
@@ -78,6 +82,28 @@ because it left the config), file permissions and ownership, content templating,
 and drift detection against package-provided default config files. gel manages
 only the files you declare, by full content.
 
+### Managed services
+
+`System::enable(unit)` and `System::disable(unit)` declare explicit intent over
+systemd units. This is deliberately not full-set convergence: gel only ever
+touches the units you name, so a unit absent from both lists is left exactly as
+it is and gel never disables a unit it was not told about.
+
+`build()` sorts and deduplicates each list. When the same unit is both enabled
+and disabled, **disable wins**: the unit is dropped from the enable list, so the
+built state never names a unit in both and an ambiguous declaration can never
+leave a unit enabled. On `apply`, gel enables each declared-enable unit that is
+currently disabled and disables each declared-disable unit that is currently
+enabled (units already in the desired state are skipped). It records each touched
+unit's prior enabled state, so `rollback` restores it: a unit gel enabled is
+disabled again, and a unit gel disabled is re-enabled. `is_enabled` treats
+systemd's `enabled-runtime` state as enabled.
+
+Not yet handled (planned for later phases): unit masking, drop-in override files,
+`--user` units, runtime start/stop state (gel manages enablement, not whether a
+unit is currently running), and templated/instanced units. gel manages only the
+enable/disable state of the units you declare.
+
 ### 2. Evaluate (pure, always available)
 
 `gel eval` compiles and runs the config crate and writes the desired state to an
@@ -92,20 +118,22 @@ gel eval examples/host-config --out /tmp/desired.json
 ### 3. Diff and apply (require an Arch build)
 
 ```sh
-gel diff                 # preview the plan: +N to install, -N to remove, ~N files (read-only)
-gel apply                # additive converge: install what is missing, write managed files
+gel diff                 # preview the plan: packages, files, and service changes (read-only)
+gel apply                # additive converge: install what is missing, write files, enable/disable units
 gel apply --prune        # also remove explicit packages absent from the config
 gel import               # capture the current explicit packages as a desired state
-gel rollback             # invert the most recent apply (packages + managed files)
+gel rollback             # invert the most recent apply (packages + files + services)
 ```
 
 `diff` also lists the managed files whose content would change (`~N files to
-write` plus each target path) and stays read-only. `apply` takes a filesystem
+write` plus each target path) and the service actions (`+N to enable, -N to
+disable` plus each unit), and stays read-only. `apply` takes a filesystem
 snapshot first (via snapper on btrfs; it degrades to a warning when snapshots are
-unavailable), prints the plan, converges packages, writes managed files, and
-records a transaction in the journal so it can be rolled back. `rollback` reverses
-packages and restores managed files to their prior content; a full snapshot-based
-filesystem restore is planned for a later phase.
+unavailable), prints the plan, converges packages, writes managed files, applies
+the service enable/disable actions, and records a transaction in the journal so it
+can be rolled back. `rollback` reverses packages, restores managed files to their
+prior content, and restores each touched unit's prior enabled state; a full
+snapshot-based filesystem restore is planned for a later phase.
 
 ### The `arch` feature
 

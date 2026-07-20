@@ -26,17 +26,36 @@ is safe (it only runs cargo and writes a file, never touching packages):
 
 ```bash
 gel eval examples/host-config --out /tmp/desired.json
-cat /tmp/desired.json   # a DesiredState: sorted native + foreign, plus managed files
+cat /tmp/desired.json   # a DesiredState: sorted native + foreign, managed files, and services
 ```
 
 The example config declares one illustrative managed file
-(`/tmp/gel-demo.conf`) via `System::file`, so the emitted artifact carries a
-`files` entry. Managed-file behavior is covered end to end by pure unit tests
-(the `System` builder's sort/last-wins in `config.rs`, `plan_files` in `plan.rs`,
-`apply`'s read-before-write backups in `apply.rs`, and `rollback_last`'s
-restore/delete in `journal.rs`); the real filesystem writes live behind the
-`arch` feature and are exercised only in the container or by hand, never against
-a developer host.
+(`/tmp/gel-demo.conf`) via `System::file` and one illustrative enabled unit
+(`systemd-timesyncd.service`) via `System::enable`, so the emitted artifact
+carries both a `files` entry and a `services.enable` entry. Managed-file behavior
+is covered end to end by pure unit tests (the `System` builder's sort/last-wins in
+`config.rs`, `plan_files` in `plan.rs`, `apply`'s read-before-write backups in
+`apply.rs`, and `rollback_last`'s restore/delete in `journal.rs`); the real
+filesystem writes live behind the `arch` feature and are exercised only in the
+container or by hand, never against a developer host.
+
+Declarative services are covered end to end by the same style of pure unit tests:
+the `System` builder's enable/disable accumulation, per-list sort/dedup, and
+disable-wins conflict resolution in `config.rs`; `plan_services` in `plan.rs`;
+`apply`'s prior-enabled-state backups in `apply.rs`; and `rollback_last`'s
+enable/disable restore in `journal.rs`. Declare intent with
+`System::enable(unit)` / `System::disable(unit)`; on `apply` gel enables each
+declared-enable unit that is currently disabled and disables each declared-disable
+unit that is currently enabled, recording each touched unit's prior enabled state
+so `rollback` restores it. When a unit is both enabled and disabled, disable wins
+(the unit is dropped from enable in `build()`, matching the planner). `is_enabled`
+treats systemd's `enabled-runtime` state as enabled. The real `systemctl` calls
+live behind the `arch` feature (mock-runner unit tests plus the container), never
+against a developer host.
+
+Deferred for later phases (not yet handled): unit masking, drop-in override
+files, `--user` units, runtime start/stop state (gel manages enablement, not
+whether a unit is currently running), and templated/instanced units.
 
 The real Arch backend (`ArchBackend`) and btrfs snapshot provider
 (`BtrfsSnapshot`) route all process execution through a `CommandRunner` seam, so

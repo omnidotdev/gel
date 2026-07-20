@@ -16,7 +16,7 @@ use gel_core::{
     apply::{ApplyOpts, apply},
     backend::{PackageBackend, arch::ArchBackend},
     journal::{self, JournalEntry},
-    plan::{Plan, plan_files},
+    plan::{Plan, plan_files, plan_services},
     snapshot::{SnapshotId, SnapshotProvider},
     snapshot_btrfs::BtrfsSnapshot,
     state::DesiredState,
@@ -60,6 +60,12 @@ pub fn diff(artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // surface managed file writes alongside the package plan; this reads current
     // file content but writes nothing, so diff stays read-only
     plan.file_writes = plan_files(&backend, &desired).context("failed to plan managed files")?;
+    // surface service enable/disable actions; this queries unit state but changes
+    // nothing, so diff stays read-only
+    let (service_enable, service_disable) =
+        plan_services(&backend, &desired).context("failed to plan service changes")?;
+    plan.service_enable = service_enable;
+    plan.service_disable = service_disable;
     render::print_plan(&plan);
     Ok(())
 }
@@ -128,6 +134,12 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // include pending file writes so the preview mentions them and the
     // already-converged short-circuit below does not skip a needed file write
     preview.file_writes = plan_files(&backend, &desired).context("failed to plan managed files")?;
+    // include pending service actions for the same reason: a service-only change
+    // must be previewed and must not be treated as "nothing to apply"
+    let (service_enable, service_disable) =
+        plan_services(&backend, &desired).context("failed to plan service changes")?;
+    preview.service_enable = service_enable;
+    preview.service_disable = service_disable;
     render::print_plan(&preview);
     if preview.is_empty() {
         println!("system already matches the desired state; nothing to apply");
@@ -154,7 +166,11 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
     let installed = entry.plan.native_install.len() + entry.plan.foreign_install.len();
     let removed = entry.plan.native_remove.len() + entry.plan.foreign_remove.len();
     let files = entry.plan.file_writes.len();
-    println!("applied: +{installed} installed, -{removed} removed, {files} files written");
+    let enabled = entry.plan.service_enable.len();
+    let disabled = entry.plan.service_disable.len();
+    println!(
+        "applied: +{installed} installed, -{removed} removed, {files} files written, +{enabled} enabled, -{disabled} disabled"
+    );
     Ok(())
 }
 
@@ -179,17 +195,21 @@ pub fn rollback() -> anyhow::Result<()> {
     let reinstall = plan.native_remove.len() + plan.foreign_remove.len();
     let uninstall = plan.native_install.len() + plan.foreign_install.len();
     let files = latest.file_backups.len();
+    let services = latest.service_backups.len();
     println!("rolling back transaction {}", latest.id);
-    println!("+{reinstall} to reinstall, -{uninstall} to remove, {files} files to restore");
+    println!(
+        "+{reinstall} to reinstall, -{uninstall} to remove, {files} files to restore, {services} services to restore"
+    );
 
     journal::rollback_last(&dir, &mut backend)
         .context("failed to roll back the last transaction")?;
 
     println!("rolled back transaction {}", latest.id);
-    // rollback reverses packages and restores gel-managed files to their prior
-    // content; a full snapshot-based filesystem restore is planned for later
+    // rollback reverses packages, restores gel-managed files to their prior
+    // content, and restores each touched unit's prior enabled state; a full
+    // snapshot-based filesystem restore is planned for later
     println!(
-        "note: this reverses packages and restores managed files; snapshot-based filesystem restore is planned for a later phase"
+        "note: this reverses packages, restores managed files, and restores prior service enabled state; snapshot-based filesystem restore is planned for a later phase"
     );
     Ok(())
 }
