@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    backend::{PackageBackend, file::FileBackend},
+    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
     error::GelError,
     state::SystemState,
     sys::{CommandRunner, SystemRunner},
@@ -218,6 +218,41 @@ impl<R: CommandRunner> FileBackend for ArchBackend<R> {
     }
 }
 
+impl<R: CommandRunner> ServiceBackend for ArchBackend<R> {
+    fn is_enabled(&self, unit: &str) -> Result<bool, GelError> {
+        let output = self.runner.run("systemctl", &["is-enabled", unit])?;
+        // `systemctl is-enabled` prints the enablement state to stdout and exits
+        // non-zero for any state other than enabled (disabled, static, masked).
+        // A non-zero exit that still names a state is a legitimate not-enabled
+        // result, not a failure; only a non-zero exit that printed no state (for
+        // example systemctl could not reach the manager, or the unit does not
+        // exist) is a real error, mirroring the pacman query's stderr handling.
+        // stderr is for server-side logs only, never surfaced to users
+        let state = output.stdout.trim();
+        if state.is_empty() {
+            if output.success {
+                return Ok(false);
+            }
+            let stderr = output.stderr.trim();
+            return Err(GelError::Backend(format!(
+                "unit enablement query failed: {stderr}"
+            )));
+        }
+        // only a genuinely enabled unit counts as enabled; static, indirect,
+        // masked and disabled units are all treated as not enabled for the
+        // purposes of gel's explicit enable/disable intent
+        Ok(matches!(state, "enabled" | "enabled-runtime"))
+    }
+
+    fn enable(&mut self, unit: &str) -> Result<(), GelError> {
+        self.run_checked("systemctl", &["enable", unit], "unit enable")
+    }
+
+    fn disable(&mut self, unit: &str) -> Result<(), GelError> {
+        self.run_checked("systemctl", &["disable", unit], "unit disable")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
@@ -409,6 +444,93 @@ mod tests {
         let mut backend = ArchBackend::with_runner(runner);
 
         let result = backend.install_native(&owned(&["tree"]));
+
+        assert!(matches!(result, Err(GelError::Backend(_))));
+    }
+
+    #[test]
+    fn is_enabled_true_for_enabled_state() {
+        // an enabled unit prints "enabled" and exits zero
+        let runner = MockRunner::new(true, "enabled\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert!(backend.is_enabled("sshd.service").expect("query"));
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "systemctl".to_owned(),
+                owned(&["is-enabled", "sshd.service"])
+            )]
+        );
+    }
+
+    #[test]
+    fn is_enabled_false_for_disabled_nonzero_exit() {
+        // `systemctl is-enabled` prints "disabled" and exits non-zero; that is a
+        // legitimate not-enabled result, not a failure
+        let runner = MockRunner::new(false, "disabled\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        assert!(!backend.is_enabled("bluetooth.service").expect("query"));
+    }
+
+    #[test]
+    fn is_enabled_false_for_masked_and_static_states() {
+        // masked and static units are not enabled for gel's intent
+        let masked = ArchBackend::with_runner(MockRunner::new(false, "masked\n", "", &[]));
+        assert!(!masked.is_enabled("foo.service").expect("query"));
+
+        let statik = ArchBackend::with_runner(MockRunner::new(true, "static\n", "", &[]));
+        assert!(!statik.is_enabled("bar.service").expect("query"));
+    }
+
+    #[test]
+    fn is_enabled_errors_when_nonzero_exit_prints_no_state() {
+        // a non-zero exit with no state on stdout but a diagnostic on stderr is a
+        // real failure (e.g. systemctl could not reach the manager)
+        let runner = MockRunner::new(false, "", "Failed to connect to bus", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        let result = backend.is_enabled("sshd.service");
+
+        assert!(matches!(result, Err(GelError::Backend(_))));
+    }
+
+    #[test]
+    fn enable_builds_systemctl_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.enable("sshd.service").expect("enable");
+
+        assert_eq!(
+            runner.calls(),
+            vec![("systemctl".to_owned(), owned(&["enable", "sshd.service"]))]
+        );
+    }
+
+    #[test]
+    fn disable_builds_systemctl_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.disable("bluetooth.service").expect("disable");
+
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "systemctl".to_owned(),
+                owned(&["disable", "bluetooth.service"])
+            )]
+        );
+    }
+
+    #[test]
+    fn enable_nonzero_exit_becomes_backend_error() {
+        let runner = MockRunner::new(false, "", "unit not found", &[]);
+        let mut backend = ArchBackend::with_runner(runner);
+
+        let result = backend.enable("missing.service");
 
         assert!(matches!(result, Err(GelError::Backend(_))));
     }
