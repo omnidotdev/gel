@@ -5,8 +5,10 @@
 //! packages, through a [`CommandRunner`] seam so the built argv is unit testable
 //! without touching the host.
 
+use std::{fs, io, path::Path};
+
 use crate::{
-    backend::PackageBackend,
+    backend::{PackageBackend, file::FileBackend},
     error::GelError,
     state::SystemState,
     sys::{CommandRunner, SystemRunner},
@@ -156,6 +158,38 @@ impl<R: CommandRunner> PackageBackend for ArchBackend<R> {
         }
         let helper = self.aur_helper()?;
         self.run_checked(helper, &remove_args(pkgs), "package removal")
+    }
+}
+
+impl<R: CommandRunner> FileBackend for ArchBackend<R> {
+    fn read_file(&self, path: &str) -> Result<Option<String>, GelError> {
+        match fs::read_to_string(path) {
+            Ok(content) => Ok(Some(content)),
+            // a missing file is a legitimately empty read, not an error
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn write_file(&mut self, path: &str, content: &str) -> Result<(), GelError> {
+        // create any missing parent directories so a managed file can be written
+        // to a fresh location without a separate mkdir step
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), GelError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            // removal is idempotent: an already-absent file is the desired end state
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 

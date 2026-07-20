@@ -12,7 +12,26 @@
 
 use std::{fs, path::Path};
 
-use crate::{backend::PackageBackend, error::GelError, plan::Plan, snapshot::SnapshotId};
+use crate::{
+    backend::{PackageBackend, file::FileBackend},
+    error::GelError,
+    plan::Plan,
+    snapshot::SnapshotId,
+};
+
+/// The content of a managed file before an apply overwrote or created it
+///
+/// Recorded per written file so rollback can restore the exact prior bytes, or
+/// delete a file the transaction created. `prior` is `None` when the file did
+/// not exist before the apply (the transaction created it), and `Some(old)`
+/// when the apply replaced pre-existing content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileBackup {
+    /// Absolute path of the managed file that was written
+    pub path: String,
+    /// The file's content before the apply, or `None` if it did not exist
+    pub prior: Option<String>,
+}
 
 /// A single recorded transaction: the plan that was applied and its snapshot
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25,6 +44,12 @@ pub struct JournalEntry {
     pub plan: Plan,
     /// The snapshot taken before the apply, when one was available
     pub snapshot: Option<SnapshotId>,
+    /// Prior content of every managed file this transaction wrote
+    ///
+    /// Defaulted so journal entries written before file management (which had no
+    /// such field) still deserialize cleanly as having backed up no files.
+    #[serde(default)]
+    pub file_backups: Vec<FileBackup>,
 }
 
 /// Write `entry` as JSON to `dir`, named by its id, creating `dir` if needed
@@ -68,14 +93,19 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// Roll back the latest journalled transaction by inverting its plan
 ///
 /// The inverse of an apply reinstalls what was removed and removes what was
-/// installed. This is a package-level undo; snapshot-based restore lives in a
-/// later layer. A missing or empty journal is a no-op.
+/// installed, then restores managed files to their pre-apply content. Each file
+/// backup is undone by writing back its prior content, or by deleting the file
+/// when the transaction created it (a `None` prior). A missing or empty journal
+/// is a no-op.
 ///
 /// # Errors
 ///
 /// Returns [`GelError`] if the journal cannot be read or a backend mutation
 /// fails.
-pub fn rollback_last(dir: &Path, b: &mut impl PackageBackend) -> Result<(), GelError> {
+pub fn rollback_last<B>(dir: &Path, b: &mut B) -> Result<(), GelError>
+where
+    B: PackageBackend + FileBackend,
+{
     let Some(entry) = read_latest(dir)? else {
         return Ok(());
     };
@@ -92,6 +122,14 @@ pub fn rollback_last(dir: &Path, b: &mut impl PackageBackend) -> Result<(), GelE
     }
     if !plan.foreign_install.is_empty() {
         b.remove_foreign(&plan.foreign_install)?;
+    }
+    // restore files after packages: a backup with prior content is written
+    // back, one with no prior was created by this transaction so it is deleted
+    for backup in &entry.file_backups {
+        match &backup.prior {
+            Some(old) => b.write_file(&backup.path, old)?,
+            None => b.remove_file(&backup.path)?,
+        }
     }
     Ok(())
 }
@@ -130,6 +168,7 @@ mod tests {
     use crate::backend::{
         PackageBackend,
         fake::{Call, FakeBackend},
+        file::FileBackend,
     };
 
     fn entry(id: &str, timestamp: &str, plan: Plan) -> JournalEntry {
@@ -138,6 +177,7 @@ mod tests {
             timestamp: timestamp.to_owned(),
             plan,
             snapshot: Some(SnapshotId("snap-1".to_owned())),
+            file_backups: Vec::new(),
         }
     }
 
@@ -238,6 +278,50 @@ mod tests {
                 Call::InstallForeign(vec!["old-aur".to_owned()]),
                 Call::RemoveNative(vec!["ripgrep".to_owned()]),
                 Call::RemoveForeign(vec!["yay".to_owned()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn rollback_last_restores_changed_files_and_deletes_created_ones() {
+        // the recorded transaction created /etc/new (no prior) and overwrote
+        // /etc/changed (prior "old"), so the post-apply backend holds both
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend =
+            FakeBackend::with_files(&[("/etc/new", "created\n"), ("/etc/changed", "new\n")]);
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: vec![
+                FileBackup {
+                    path: "/etc/changed".to_owned(),
+                    prior: Some("old\n".to_owned()),
+                },
+                FileBackup {
+                    path: "/etc/new".to_owned(),
+                    prior: None,
+                },
+            ],
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // a file the transaction created is deleted
+        assert_eq!(backend.read_file("/etc/new").expect("read"), None);
+        // a file the transaction changed is restored to its prior content
+        assert_eq!(
+            backend.read_file("/etc/changed").expect("read"),
+            Some("old\n".to_owned())
+        );
+        // the restore is a write, the deletion a remove, in backup order
+        assert_eq!(
+            backend.calls(),
+            &[
+                Call::WriteFile("/etc/changed".to_owned()),
+                Call::RemoveFile("/etc/new".to_owned()),
             ]
         );
     }
