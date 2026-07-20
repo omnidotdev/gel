@@ -11,7 +11,7 @@ fn main() {
     let system = System::new()
         // native (official-repo) packages, managed with pacman
         .native(["git", "ripgrep", "fd", "bat"])
-        // foreign (AUR) packages, managed with an AUR helper
+        // foreign (AUR) packages, managed with paru
         .foreign(["paru"])
         // a managed file: gel writes this content verbatim on apply and restores
         // the prior content on rollback. The path here is deliberately a harmless

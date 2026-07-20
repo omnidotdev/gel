@@ -1,0 +1,27 @@
+# Copy-me starter for a gel machine config
+#
+# Unlike examples/host-config (which path-depends on gel-core for in-repo
+# testing), this starter depends on gel-core via git, so you can copy this
+# directory ANYWHERE and `gel eval` it without a checkout of the gel repo:
+#
+#   cp -r examples/starter ~/my-config
+#   gel eval ~/my-config --out ~/desired.json
+#
+# Once gel-core is published to crates.io you can switch the dependency to a
+# plain version (gel-core = "0.1").
+[package]
+name = "my-config"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Empty table: makes this its own workspace root, independent of any parent.
+[workspace]
+
+[[bin]]
+name = "my-config"
+path = "src/main.rs"
+
+[dependencies]
+gel-core = { git = "https://github.com/omnidotdev/gel" }
+serde_json = "1"

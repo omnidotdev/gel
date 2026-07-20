@@ -27,6 +27,51 @@ cargo build --release
 # Binary will be at target/release/gel
 ```
 
+## Bootstrap a fresh Arch machine
+
+gel configures an already-installed, booted Arch system. It is not an OS
+installer: do the base install first (archinstall, or a manual `pacstrap` +
+bootloader + network), boot into it, then bring the machine up with gel.
+
+**One command** (installs gel, then applies a config crate you point it at):
+
+```sh
+# on the fresh box, as a normal user with sudo
+curl -fsSL https://raw.githubusercontent.com/omnidotdev/gel/master/scripts/bootstrap.sh | bash -s -- \
+  --config ./my-config --apply
+```
+
+**Or the minimum manual steps:**
+
+```sh
+# 1. install gel (build from source until the first release lands)
+sudo pacman -S --needed base-devel git rust
+git clone https://github.com/omnidotdev/gel && cd gel
+cargo build --release --features arch
+sudo install -Dm755 target/release/gel /usr/local/bin/gel
+
+# 2. author your machine as config (copy the starter; it depends on gel-core
+#    via git, so it works from anywhere, not just inside this checkout)
+cp -r examples/starter ~/my-config          # edit ~/my-config/src/main.rs
+
+# 3. evaluate -> preview -> converge
+gel eval ~/my-config --out ~/desired.json
+gel diff  --artifact ~/desired.json         # read-only plan
+gel apply --artifact ~/desired.json         # converge the machine
+gel rollback                                # undo the last apply
+```
+
+What `apply` brings up in one shot: your explicit packages (native + AUR), managed
+config files, enabled/disabled services, and system settings (hostname, timezone,
+locale). Two caveats for a truly bare box:
+
+- **AUR packages use [paru](https://github.com/Morganamilo/paru)**, gel's
+  opinionated AUR helper. `bootstrap.sh` installs it by default (pass `--no-paru`
+  to skip). Native packages, files, services, and settings work without it.
+- **Snapshot rollback needs a btrfs root with snapper.** On other filesystems gel
+  falls back to its transaction journal (which still rolls back packages, files,
+  services, and settings).
+
 ## Quick Start
 
 ```sh
@@ -52,7 +97,7 @@ use gel_core::config::System;
 fn main() {
     let system = System::new()
         .native(["git", "ripgrep", "fd", "bat"]) // official-repo packages (pacman)
-        .foreign(["paru"]) // AUR packages (AUR helper)
+        .foreign(["some-aur-pkg"]) // AUR packages (installed via paru)
         // a managed file: gel writes this content verbatim on apply
         .file("/tmp/gel-demo.conf", "greeting = hello\n")
         .enable("systemd-timesyncd.service") // ensure a unit is enabled
@@ -164,7 +209,7 @@ later phase.
 ### The `arch` feature
 
 The system-touching commands (`import`, `diff`, `apply`, `rollback`) drive real
-`pacman`/AUR-helper/snapper tooling and are only compiled with the `arch` feature:
+`pacman`/`paru`/`systemctl`/snapper tooling and are only compiled with the `arch` feature:
 
 ```sh
 cargo build --release --features arch    # binary with the real Arch backend

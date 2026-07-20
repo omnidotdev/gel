@@ -128,8 +128,8 @@ Coverage inside the container:
   full binary flow manually with `scripts/test-arch.sh` open (root shell in the
   container), running the `gel` subcommands by hand.
 
-- AUR helper path: pacman requires root, so the container runs the tests as
-  root; AUR helpers (`paru`/`yay`) refuse to run as root. The image already
+- AUR (paru) path: pacman requires root, so the container runs the tests as
+  root; `paru` refuses to run as root. The image already
   provisions a passwordless-sudo `builder` user for a future in-container AUR
   test, but the foreign (AUR) install/remove path is currently covered only by
   the mock-runner unit tests, not end to end.
