@@ -1,8 +1,10 @@
 use crate::{
-    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
+    backend::{
+        PackageBackend, file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
+    },
     error::GelError,
-    journal::{FileBackup, ServiceBackup},
-    plan::{Plan, plan_files, plan_services},
+    journal::{FileBackup, ServiceBackup, SettingBackup},
+    plan::{Plan, plan_files, plan_services, plan_settings},
     state::DesiredState,
 };
 
@@ -32,6 +34,8 @@ pub struct Applied {
     pub file_backups: Vec<FileBackup>,
     /// Prior enabled-state of each unit toggled, so it can be rolled back
     pub service_backups: Vec<ServiceBackup>,
+    /// Prior value of each setting changed, so it can be rolled back
+    pub setting_backups: Vec<SettingBackup>,
 }
 
 /// Reconcile a backend toward `desired`, returning what was applied
@@ -58,10 +62,17 @@ pub struct Applied {
 /// transaction can restore it. The toggled units populate `plan.service_enable`
 /// and `plan.service_disable` so the effective plan reflects them.
 ///
+/// After services, declared settings converge: only settings named in
+/// `desired.settings` are considered, and for each setting whose current value
+/// differs from the desired value its prior value is read and recorded as a
+/// [`SettingBackup`] before it is set, so the transaction can restore it. The
+/// changed settings populate `plan.setting_changes` so the effective plan
+/// reflects them.
+///
 /// # Errors
 ///
 /// Returns [`GelError`] if any backend query or mutation fails.
-pub fn apply<B: PackageBackend + FileBackend + ServiceBackend>(
+pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>(
     b: &mut B,
     desired: &DesiredState,
     opts: ApplyOpts,
@@ -126,10 +137,24 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend>(
     plan.service_enable = enable;
     plan.service_disable = disable;
 
+    // converge declared settings after services, capturing prior value per change.
+    // plan_settings only returns settings whose current value differs, so every
+    // entry here genuinely changes and is worth backing up
+    let setting_changes = plan_settings(b, desired)?;
+    let mut setting_backups = Vec::with_capacity(setting_changes.len());
+    for (key, value) in &setting_changes {
+        // read the prior value BEFORE setting so rollback can restore it
+        let prior = b.get(*key)?;
+        b.set(*key, value)?;
+        setting_backups.push(SettingBackup { key: *key, prior });
+    }
+    plan.setting_changes = setting_changes;
+
     Ok(Applied {
         plan,
         file_backups,
         service_backups,
+        setting_backups,
     })
 }
 
@@ -139,10 +164,10 @@ mod tests {
     use crate::{
         backend::{
             PackageBackend, fake::Call, fake::FakeBackend, file::FileBackend,
-            service::ServiceBackend,
+            service::ServiceBackend, settings::SettingsBackend,
         },
-        journal::{FileBackup, ServiceBackup},
-        state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent},
+        journal::{FileBackup, ServiceBackup, SettingBackup},
+        state::{DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent},
     };
 
     fn desired_files(files: Vec<ManagedFile>) -> DesiredState {
@@ -344,16 +369,162 @@ mod tests {
     }
 
     #[test]
+    fn apply_changes_declared_setting_and_backs_up_prior_value() {
+        // seed a prior value so the apply must change it and record the old value
+        let mut backend = FakeBackend::with_settings(&[(SettingKey::Hostname, "old")]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent::default(),
+            settings: SettingsIntent {
+                hostname: Some("gelbox".to_owned()),
+                ..SettingsIntent::default()
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the setting now holds the desired value on the backend
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("get"),
+            Some("gelbox".to_owned())
+        );
+        // its prior value is recorded so rollback can restore it
+        assert_eq!(
+            applied.setting_backups,
+            vec![SettingBackup {
+                key: SettingKey::Hostname,
+                prior: Some("old".to_owned()),
+            }]
+        );
+        // the effective plan reflects the change
+        assert_eq!(
+            applied.plan.setting_changes,
+            vec![(SettingKey::Hostname, "gelbox".to_owned())]
+        );
+        // the set is observable in the call log
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetSetting(SettingKey::Hostname, "gelbox".to_owned()))
+        );
+    }
+
+    #[test]
+    fn apply_sets_unset_declared_setting_with_none_prior() {
+        // no seed, so the setting reads None before the apply
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent::default(),
+            settings: SettingsIntent {
+                timezone: Some("UTC".to_owned()),
+                ..SettingsIntent::default()
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the setting now holds the desired value
+        assert_eq!(
+            backend.get(SettingKey::Timezone).expect("get"),
+            Some("UTC".to_owned())
+        );
+        // a previously unset setting records a None prior, so rollback leaves it be
+        assert_eq!(
+            applied.setting_backups,
+            vec![SettingBackup {
+                key: SettingKey::Timezone,
+                prior: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_skips_setting_already_equal_to_desired() {
+        let mut backend = FakeBackend::with_settings(&[(SettingKey::Hostname, "gelbox")]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent::default(),
+            settings: SettingsIntent {
+                hostname: Some("gelbox".to_owned()),
+                ..SettingsIntent::default()
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // an already-matching setting is neither changed nor backed up
+        assert!(applied.plan.setting_changes.is_empty());
+        assert!(applied.setting_backups.is_empty());
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::SetSetting(..)))
+        );
+    }
+
+    #[test]
+    fn apply_then_rollback_leaves_a_none_prior_setting_as_is() {
+        use crate::journal::{JournalEntry, rollback_last, write_entry};
+
+        // no seed: the timezone is unset, so the apply records a None prior
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent::default(),
+            settings: SettingsIntent {
+                timezone: Some("UTC".to_owned()),
+                ..SettingsIntent::default()
+            },
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: applied.plan,
+            snapshot: None,
+            file_backups: applied.file_backups,
+            service_backups: applied.service_backups,
+            setting_backups: applied.setting_backups,
+        };
+        write_entry(dir.path(), &entry).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // a None-prior setting cannot be unset, so rollback leaves the value in
+        // place rather than erroring or clearing it
+        assert_eq!(
+            backend.get(SettingKey::Timezone).expect("get"),
+            Some("UTC".to_owned())
+        );
+    }
+
+    #[test]
     fn full_apply_then_rollback_restores_files_services_and_inverts_packages() {
         use crate::journal::{JournalEntry, rollback_last, write_entry};
 
         // start: git + vim installed, one pre-existing managed file with old
         // content, bluetooth enabled (to be disabled), sshd disabled (to be
-        // enabled)
+        // enabled), hostname set to "old" (to be changed to "gelbox")
         let mut backend = FakeBackend::with_explicit(&["git", "vim"], &[]);
         backend.set_file("/etc/changed", "old\n");
         backend.enable("bluetooth.service").expect("seed enable");
-        // the seeding enable must not leak into the transaction call log below
+        backend
+            .set(SettingKey::Hostname, "old")
+            .expect("seed setting");
+        // the seeding calls must not leak into the transaction call log below
         let seeded_calls = backend.calls().len();
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
@@ -372,7 +543,10 @@ mod tests {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec!["bluetooth.service".to_owned()],
             },
-            settings: SettingsIntent::default(),
+            settings: SettingsIntent {
+                hostname: Some("gelbox".to_owned()),
+                ..SettingsIntent::default()
+            },
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -380,6 +554,18 @@ mod tests {
         // the apply enabled sshd and disabled bluetooth, and recorded each prior
         assert!(backend.is_enabled("sshd.service").expect("query"));
         assert!(!backend.is_enabled("bluetooth.service").expect("query"));
+        // the apply changed the hostname and recorded its prior value
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("query"),
+            Some("gelbox".to_owned())
+        );
+        assert_eq!(
+            applied.setting_backups,
+            vec![SettingBackup {
+                key: SettingKey::Hostname,
+                prior: Some("old".to_owned()),
+            }]
+        );
         assert_eq!(
             applied.service_backups,
             vec![
@@ -409,6 +595,7 @@ mod tests {
             snapshot: None,
             file_backups: applied.file_backups,
             service_backups: applied.service_backups,
+            setting_backups: applied.setting_backups,
         };
         write_entry(dir.path(), &entry).expect("write");
 
@@ -431,6 +618,11 @@ mod tests {
         // enabled is disabled again, the one it disabled is enabled again
         assert!(!backend.is_enabled("sshd.service").expect("query"));
         assert!(backend.is_enabled("bluetooth.service").expect("query"));
+        // the setting is restored to its prior value
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("query"),
+            Some("old".to_owned())
+        );
     }
 
     #[test]
@@ -510,6 +702,7 @@ mod tests {
             snapshot: None,
             file_backups: applied.file_backups,
             service_backups: applied.service_backups,
+            setting_backups: applied.setting_backups,
         };
         write_entry(dir.path(), &entry).expect("write");
 

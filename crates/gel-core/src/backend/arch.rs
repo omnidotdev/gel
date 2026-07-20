@@ -11,9 +11,11 @@ use std::{
 };
 
 use crate::{
-    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
+    backend::{
+        PackageBackend, file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
+    },
     error::GelError,
-    state::SystemState,
+    state::{SettingKey, SystemState},
     sys::{CommandRunner, SystemRunner},
 };
 
@@ -251,6 +253,71 @@ impl<R: CommandRunner> ServiceBackend for ArchBackend<R> {
 
     fn disable(&mut self, unit: &str) -> Result<(), GelError> {
         self.run_checked("systemctl", &["disable", unit], "unit disable")
+    }
+}
+
+/// Extract a setting's current value from its reading command's stdout
+///
+/// The hostname and timezone commands print the bare value on a single line, so
+/// it is trimmed directly. `localectl status` prints several indented lines; the
+/// locale is the `LANG=` assignment, pulled out by [`parse_lang`]. An empty or
+/// missing value is reported as `None` (unset), so a converge can still set it.
+fn parse_setting_value(key: SettingKey, stdout: &str) -> Option<String> {
+    match key {
+        SettingKey::Hostname | SettingKey::Timezone => {
+            let value = stdout.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        SettingKey::Locale => parse_lang(stdout),
+    }
+}
+
+/// Pull the `LANG=` value out of `localectl status` output
+///
+/// `localectl status` prints a `System Locale: LANG=<value>` line among others;
+/// the value is the token after `LANG=`. Returns `None` when no such assignment
+/// is present or it is empty.
+fn parse_lang(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("LANG="))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+impl<R: CommandRunner> SettingsBackend for ArchBackend<R> {
+    fn get(&self, key: SettingKey) -> Result<Option<String>, GelError> {
+        // read the current value through the tool that owns each setting
+        let output = match key {
+            SettingKey::Hostname => self.runner.run("hostnamectl", &["hostname"])?,
+            SettingKey::Timezone => self
+                .runner
+                .run("timedatectl", &["show", "--property=Timezone", "--value"])?,
+            SettingKey::Locale => self.runner.run("localectl", &["status"])?,
+        };
+        // a non-zero exit means the value could not be read; report it as unset
+        // rather than an error so a convergence can still set it. stderr is for
+        // server-side logs only, never surfaced to users
+        if !output.success {
+            return Ok(None);
+        }
+        Ok(parse_setting_value(key, &output.stdout))
+    }
+
+    fn set(&mut self, key: SettingKey, value: &str) -> Result<(), GelError> {
+        match key {
+            SettingKey::Hostname => {
+                self.run_checked("hostnamectl", &["set-hostname", value], "hostname change")
+            }
+            SettingKey::Timezone => {
+                self.run_checked("timedatectl", &["set-timezone", value], "timezone change")
+            }
+            SettingKey::Locale => {
+                // localectl takes the locale as a `LANG=` assignment
+                let lang = format!("LANG={value}");
+                self.run_checked("localectl", &["set-locale", &lang], "locale change")
+            }
+        }
     }
 }
 
@@ -532,6 +599,118 @@ mod tests {
         let mut backend = ArchBackend::with_runner(runner);
 
         let result = backend.enable("missing.service");
+
+        assert!(matches!(result, Err(GelError::Backend(_))));
+    }
+
+    #[test]
+    fn get_hostname_reads_value_and_builds_argv() {
+        let runner = MockRunner::new(true, "gelbox\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("get"),
+            Some("gelbox".to_owned())
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![("hostnamectl".to_owned(), owned(&["hostname"]))]
+        );
+    }
+
+    #[test]
+    fn get_timezone_builds_timedatectl_argv() {
+        let runner = MockRunner::new(true, "UTC\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert_eq!(
+            backend.get(SettingKey::Timezone).expect("get"),
+            Some("UTC".to_owned())
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "timedatectl".to_owned(),
+                owned(&["show", "--property=Timezone", "--value"])
+            )]
+        );
+    }
+
+    #[test]
+    fn get_locale_parses_lang_from_status() {
+        // localectl status prints several indented lines; the LANG assignment is
+        // pulled out of the System Locale line
+        let status = "   System Locale: LANG=en_US.UTF-8\n       VC Keymap: us\n";
+        let runner = MockRunner::new(true, status, "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert_eq!(
+            backend.get(SettingKey::Locale).expect("get"),
+            Some("en_US.UTF-8".to_owned())
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![("localectl".to_owned(), owned(&["status"]))]
+        );
+    }
+
+    #[test]
+    fn get_setting_reports_none_on_nonzero_exit() {
+        // an unreadable setting is surfaced as unset, not an error
+        let runner = MockRunner::new(false, "", "Failed to connect to bus", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        assert_eq!(backend.get(SettingKey::Hostname).expect("get"), None);
+    }
+
+    #[test]
+    fn set_hostname_builds_hostnamectl_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.set(SettingKey::Hostname, "gelbox").expect("set");
+
+        assert_eq!(
+            runner.calls(),
+            vec![("hostnamectl".to_owned(), owned(&["set-hostname", "gelbox"]))]
+        );
+    }
+
+    #[test]
+    fn set_timezone_builds_timedatectl_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.set(SettingKey::Timezone, "UTC").expect("set");
+
+        assert_eq!(
+            runner.calls(),
+            vec![("timedatectl".to_owned(), owned(&["set-timezone", "UTC"]))]
+        );
+    }
+
+    #[test]
+    fn set_locale_builds_localectl_lang_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.set(SettingKey::Locale, "en_US.UTF-8").expect("set");
+
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "localectl".to_owned(),
+                owned(&["set-locale", "LANG=en_US.UTF-8"])
+            )]
+        );
+    }
+
+    #[test]
+    fn set_setting_nonzero_exit_becomes_backend_error() {
+        let runner = MockRunner::new(false, "", "permission denied", &[]);
+        let mut backend = ArchBackend::with_runner(runner);
+
+        let result = backend.set(SettingKey::Hostname, "gelbox");
 
         assert!(matches!(result, Err(GelError::Backend(_))));
     }

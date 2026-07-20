@@ -13,10 +13,13 @@
 use std::{fs, path::Path};
 
 use crate::{
-    backend::{PackageBackend, file::FileBackend, service::ServiceBackend},
+    backend::{
+        PackageBackend, file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
+    },
     error::GelError,
     plan::Plan,
     snapshot::SnapshotId,
+    state::SettingKey,
 };
 
 /// The content of a managed file before an apply overwrote or created it
@@ -48,6 +51,23 @@ pub struct ServiceBackup {
     pub prior_enabled: bool,
 }
 
+/// The value of a global system setting before an apply changed it
+///
+/// Recorded per setting the transaction actually changed, mirroring
+/// [`FileBackup`] and [`ServiceBackup`], so rollback can restore the exact prior
+/// value. `prior` is `Some(old)` when the setting had a readable value before the
+/// apply replaced it, and `None` when the setting was unset or unreadable. A
+/// `None` prior cannot be undone: a scalar system setting (hostname, timezone,
+/// locale) has no meaningful "unset" state to restore to, so rollback leaves it
+/// as-is rather than erroring.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SettingBackup {
+    /// Which setting was changed
+    pub key: SettingKey,
+    /// The setting's value before the apply, or `None` if it was unset
+    pub prior: Option<String>,
+}
+
 /// A single recorded transaction: the plan that was applied and its snapshot
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
@@ -71,6 +91,12 @@ pub struct JournalEntry {
     /// no such field) still deserialize cleanly as having toggled no units.
     #[serde(default)]
     pub service_backups: Vec<ServiceBackup>,
+    /// Prior value of every global setting this transaction changed
+    ///
+    /// Defaulted so journal entries written before settings management (which had
+    /// no such field) still deserialize cleanly as having changed no settings.
+    #[serde(default)]
+    pub setting_backups: Vec<SettingBackup>,
 }
 
 /// Write `entry` as JSON to `dir`, named by its id, creating `dir` if needed
@@ -114,12 +140,14 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// Roll back the latest journalled transaction by inverting its plan
 ///
 /// The inverse of an apply reinstalls what was removed and removes what was
-/// installed, restores managed files to their pre-apply content, then restores
-/// each toggled unit to its prior enabled-state. Each file backup is undone by
-/// writing back its prior content, or by deleting the file when the transaction
-/// created it (a `None` prior). Each service backup is undone by re-enabling a
-/// unit the apply disabled or disabling a unit it enabled. A missing or empty
-/// journal is a no-op.
+/// installed, restores managed files to their pre-apply content, restores each
+/// toggled unit to its prior enabled-state, then restores each changed setting to
+/// its prior value. Each file backup is undone by writing back its prior content,
+/// or by deleting the file when the transaction created it (a `None` prior). Each
+/// service backup is undone by re-enabling a unit the apply disabled or disabling
+/// a unit it enabled. Each setting backup with a `Some` prior is set back to that
+/// value; a `None` prior is left as-is, because a scalar system setting cannot be
+/// meaningfully unset. A missing or empty journal is a no-op.
 ///
 /// # Errors
 ///
@@ -127,7 +155,7 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// fails.
 pub fn rollback_last<B>(dir: &Path, b: &mut B) -> Result<(), GelError>
 where
-    B: PackageBackend + FileBackend + ServiceBackend,
+    B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend,
 {
     let Some(entry) = read_latest(dir)? else {
         return Ok(());
@@ -154,13 +182,22 @@ where
             None => b.remove_file(&backup.path)?,
         }
     }
-    // restore services last: re-enable a unit the apply disabled, disable one it
-    // enabled, so each toggled unit returns to its recorded prior state
+    // restore services after files: re-enable a unit the apply disabled, disable
+    // one it enabled, so each toggled unit returns to its recorded prior state
     for backup in &entry.service_backups {
         if backup.prior_enabled {
             b.enable(&backup.unit)?;
         } else {
             b.disable(&backup.unit)?;
+        }
+    }
+    // restore settings last: a backup with a prior value is set back to it. A
+    // backup with no prior (the setting was unset or unreadable before the apply)
+    // is left as-is: a scalar system setting has no meaningful unset state to
+    // restore to, so skip it rather than erroring
+    for backup in &entry.setting_backups {
+        if let Some(old) = &backup.prior {
+            b.set(backup.key, old)?;
         }
     }
     Ok(())
@@ -202,6 +239,7 @@ mod tests {
         fake::{Call, FakeBackend},
         file::FileBackend,
         service::ServiceBackend,
+        settings::SettingsBackend,
     };
 
     fn entry(id: &str, timestamp: &str, plan: Plan) -> JournalEntry {
@@ -212,6 +250,7 @@ mod tests {
             snapshot: Some(SnapshotId("snap-1".to_owned())),
             file_backups: Vec::new(),
             service_backups: Vec::new(),
+            setting_backups: Vec::new(),
         }
     }
 
@@ -362,6 +401,7 @@ mod tests {
                 },
             ],
             service_backups: Vec::new(),
+            setting_backups: Vec::new(),
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -407,6 +447,7 @@ mod tests {
                     prior_enabled: true,
                 },
             ],
+            setting_backups: Vec::new(),
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -423,6 +464,76 @@ mod tests {
                 Call::DisableService("sshd.service".to_owned()),
                 Call::EnableService("bluetooth.service".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn rollback_last_restores_prior_setting_value() {
+        // the recorded transaction changed the hostname from "old" to "gelbox",
+        // so the post-apply backend holds "gelbox"
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FakeBackend::with_settings(&[(SettingKey::Hostname, "gelbox")]);
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: Vec::new(),
+            service_backups: Vec::new(),
+            setting_backups: vec![SettingBackup {
+                key: SettingKey::Hostname,
+                prior: Some("old".to_owned()),
+            }],
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // the setting is restored to its recorded prior value
+        assert_eq!(
+            backend.get(SettingKey::Hostname).expect("get"),
+            Some("old".to_owned())
+        );
+        // the restore issues a single set back to the prior value
+        assert_eq!(
+            backend.calls(),
+            &[Call::SetSetting(SettingKey::Hostname, "old".to_owned())]
+        );
+    }
+
+    #[test]
+    fn rollback_last_leaves_unset_setting_as_is() {
+        // the recorded transaction set a timezone that had no prior value; rollback
+        // cannot unset a scalar system setting, so it must leave the value in place
+        // and issue no set call, without erroring
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FakeBackend::with_settings(&[(SettingKey::Timezone, "UTC")]);
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: Vec::new(),
+            service_backups: Vec::new(),
+            setting_backups: vec![SettingBackup {
+                key: SettingKey::Timezone,
+                prior: None,
+            }],
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // the value applied is left untouched, and no set call was made
+        assert_eq!(
+            backend.get(SettingKey::Timezone).expect("get"),
+            Some("UTC".to_owned())
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::SetSetting(..)))
         );
     }
 }
