@@ -230,6 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn entry_without_file_backups_key_deserializes_as_empty() {
+        // a journal entry written before file management carried no `file_backups`
+        // key; it must still deserialize, defaulting to no backed-up files
+        let json = r#"{
+            "id": "tx-1",
+            "timestamp": "2026-07-19T00:00:00Z",
+            "plan": {
+                "native_install": [],
+                "native_remove": [],
+                "foreign_install": [],
+                "foreign_remove": [],
+                "file_writes": []
+            },
+            "snapshot": null
+        }"#;
+
+        let entry: JournalEntry = serde_json::from_str(json).expect("deserialize");
+
+        assert!(entry.file_backups.is_empty());
+        assert_eq!(entry.id, "tx-1");
+    }
+
+    #[test]
     fn read_latest_skips_corrupt_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let valid = entry("tx-1", "2026-07-19T00:00:00Z", Plan::default());

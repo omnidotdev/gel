@@ -5,7 +5,10 @@
 //! packages, through a [`CommandRunner`] seam so the built argv is unit testable
 //! without touching the host.
 
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     backend::{PackageBackend, file::FileBackend},
@@ -109,6 +112,19 @@ fn install_args(pkgs: &[String]) -> Vec<&str> {
     args
 }
 
+/// A temp path in the same directory as `target`, for an atomic write + rename
+///
+/// Placing the temp file beside the target keeps it on the same filesystem, so
+/// the subsequent rename is a same-device atomic swap rather than a copy.
+fn sibling_tmp(target: &Path) -> PathBuf {
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("gel");
+    let tmp_name = format!(".{name}.gel.tmp");
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    }
+}
+
 /// Build removal argv shared by pacman and AUR helpers
 fn remove_args(pkgs: &[String]) -> Vec<&str> {
     let mut args = vec!["-Rns", "--noconfirm"];
@@ -174,12 +190,20 @@ impl<R: CommandRunner> FileBackend for ArchBackend<R> {
     fn write_file(&mut self, path: &str, content: &str) -> Result<(), GelError> {
         // create any missing parent directories so a managed file can be written
         // to a fresh location without a separate mkdir step
-        if let Some(parent) = Path::new(path).parent() {
+        let target = Path::new(path);
+        if let Some(parent) = target.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(path, content)?;
+        // write to a temp file in the SAME directory then rename into place, so a
+        // crash mid-write cannot leave a partially written config at the final
+        // path (rename is atomic on POSIX). The temp sibling shares the target's
+        // filesystem, so the rename never falls back to a cross-device copy. This
+        // mirrors the journal writer's atomic write
+        let tmp = sibling_tmp(target);
+        fs::write(&tmp, content)?;
+        fs::rename(&tmp, target)?;
         Ok(())
     }
 
