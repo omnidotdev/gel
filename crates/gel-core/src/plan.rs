@@ -96,6 +96,7 @@ mod tests {
             native: vec![],
             foreign: vec![],
             files,
+            services: crate::state::ServiceIntent::default(),
         }
     }
 
@@ -181,11 +182,13 @@ mod tests {
             native: vec!["git".to_owned(), "vim".to_owned()],
             foreign: vec![],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec!["yay".to_owned()],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         let plan = Plan::compute(&current, &desired);
@@ -202,6 +205,7 @@ mod tests {
             native: vec!["git".to_owned(), "vim".to_owned()],
             foreign: vec!["yay".to_owned()],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         let plan = Plan::compute(&state, &state);
@@ -215,11 +219,13 @@ mod tests {
             native: vec!["vim".to_owned(), "git".to_owned()],
             foreign: vec![],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
         let desired = DesiredState {
             native: vec!["zsh".to_owned(), "bash".to_owned(), "bash".to_owned()],
             foreign: vec![],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         let plan = Plan::compute(&current, &desired);

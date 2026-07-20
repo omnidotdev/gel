@@ -109,6 +109,7 @@ mod tests {
             native: vec![],
             foreign: vec![],
             files,
+            services: crate::state::ServiceIntent::default(),
         }
     }
 
@@ -212,6 +213,7 @@ mod tests {
                     content: "new\n".to_owned(),
                 },
             ],
+            services: crate::state::ServiceIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -251,6 +253,7 @@ mod tests {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec![],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -279,6 +282,7 @@ mod tests {
             native: vec!["git".to_owned()],
             foreign: vec![],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");
@@ -303,6 +307,7 @@ mod tests {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec![],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
 
@@ -340,6 +345,7 @@ mod tests {
             native: vec!["git".to_owned()],
             foreign: vec!["yay".to_owned()],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         let result = apply(&mut backend, &desired, ApplyOpts { prune: false });
@@ -367,6 +373,7 @@ mod tests {
             native: vec![],
             foreign: vec!["keep-aur".to_owned(), "new-aur".to_owned()],
             files: vec![],
+            services: crate::state::ServiceIntent::default(),
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");

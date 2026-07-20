@@ -82,6 +82,7 @@ impl System {
             native: sorted_unique(self.native),
             foreign: sorted_unique(self.foreign),
             files: sorted_unique_files(self.files),
+            services: crate::state::ServiceIntent::default(),
         }
     }
 }
@@ -126,6 +127,7 @@ mod tests {
                 native: vec!["git".to_owned(), "ripgrep".to_owned()],
                 foreign: vec!["yay".to_owned()],
                 files: vec![],
+                services: crate::state::ServiceIntent::default(),
             }
         );
     }

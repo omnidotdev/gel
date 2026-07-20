@@ -118,6 +118,7 @@ impl PackageBackend for FakeBackend {
             native: self.native.clone(),
             foreign: self.foreign.clone(),
             files: Vec::new(),
+            services: crate::state::ServiceIntent::default(),
         })
     }
 

@@ -143,6 +143,7 @@ impl<R: CommandRunner> PackageBackend for ArchBackend<R> {
             native,
             foreign,
             files: Vec::new(),
+            services: crate::state::ServiceIntent::default(),
         })
     }
 
