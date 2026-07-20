@@ -58,10 +58,12 @@ mod tests {
         let current = DesiredState {
             native: vec!["git".to_owned(), "vim".to_owned()],
             foreign: vec![],
+            files: vec![],
         };
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec!["yay".to_owned()],
+            files: vec![],
         };
 
         let plan = Plan::compute(&current, &desired);
@@ -77,6 +79,7 @@ mod tests {
         let state = DesiredState {
             native: vec!["git".to_owned(), "vim".to_owned()],
             foreign: vec!["yay".to_owned()],
+            files: vec![],
         };
 
         let plan = Plan::compute(&state, &state);
@@ -89,10 +92,12 @@ mod tests {
         let current = DesiredState {
             native: vec!["vim".to_owned(), "git".to_owned()],
             foreign: vec![],
+            files: vec![],
         };
         let desired = DesiredState {
             native: vec!["zsh".to_owned(), "bash".to_owned(), "bash".to_owned()],
             foreign: vec![],
+            files: vec![],
         };
 
         let plan = Plan::compute(&current, &desired);

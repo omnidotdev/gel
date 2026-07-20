@@ -65,6 +65,7 @@ mod tests {
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec![],
+            files: vec![],
         };
 
         let plan = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -92,6 +93,7 @@ mod tests {
         let desired = DesiredState {
             native: vec!["git".to_owned()],
             foreign: vec![],
+            files: vec![],
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");
@@ -115,6 +117,7 @@ mod tests {
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
             foreign: vec![],
+            files: vec![],
         };
         let plan = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
 
@@ -150,6 +153,7 @@ mod tests {
         let desired = DesiredState {
             native: vec!["git".to_owned()],
             foreign: vec!["yay".to_owned()],
+            files: vec![],
         };
 
         let result = apply(&mut backend, &desired, ApplyOpts { prune: false });
@@ -176,6 +180,7 @@ mod tests {
         let desired = DesiredState {
             native: vec![],
             foreign: vec!["keep-aur".to_owned(), "new-aur".to_owned()],
+            files: vec![],
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");

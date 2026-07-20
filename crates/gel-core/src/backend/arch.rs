@@ -120,7 +120,12 @@ impl<R: CommandRunner> PackageBackend for ArchBackend<R> {
         let native = self.query_names(&["-Qqen"])?;
         // explicit foreign (AUR / not in any sync db) packages
         let foreign = self.query_names(&["-Qqem"])?;
-        Ok(SystemState { native, foreign })
+        // A package backend does not report managed files
+        Ok(SystemState {
+            native,
+            foreign,
+            files: Vec::new(),
+        })
     }
 
     fn install_native(&mut self, pkgs: &[String]) -> Result<(), GelError> {

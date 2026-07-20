@@ -90,6 +90,7 @@ impl PackageBackend for FakeBackend {
         Ok(SystemState {
             native: self.native.clone(),
             foreign: self.foreign.clone(),
+            files: Vec::new(),
         })
     }
 

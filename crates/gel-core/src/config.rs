@@ -58,6 +58,8 @@ impl System {
         DesiredState {
             native: sorted_unique(self.native),
             foreign: sorted_unique(self.foreign),
+            // File management is not authored through this package builder yet
+            files: Vec::new(),
         }
     }
 }
@@ -85,6 +87,7 @@ mod tests {
             DesiredState {
                 native: vec!["git".to_owned(), "ripgrep".to_owned()],
                 foreign: vec!["yay".to_owned()],
+                files: vec![],
             }
         );
     }
