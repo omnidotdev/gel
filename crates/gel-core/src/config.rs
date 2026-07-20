@@ -1,21 +1,26 @@
 //! Pure builder for authoring a desired system configuration
 //!
 //! [`System`] accumulates the native (official-repo) and foreign (AUR) packages
-//! a machine should have and lowers them into a [`DesiredState`]. It is a pure
-//! data structure: no filesystem, process, or clock access lives here, so a user
-//! config crate can depend on it and be evaluated deterministically.
+//! a machine should have, plus any declaratively managed files, and lowers them
+//! into a [`DesiredState`]. It is a pure data structure: no filesystem, process,
+//! or clock access lives here, so a user config crate can depend on it and be
+//! evaluated deterministically.
 
-use crate::state::DesiredState;
+use std::collections::BTreeMap;
+
+use crate::state::{DesiredState, ManagedFile};
 
 /// Accumulates the native and foreign packages a machine should have
 ///
 /// Construct with [`System::new`], add packages with [`System::native`] and
-/// [`System::foreign`] (both chainable and order-independent), then lower into a
-/// [`DesiredState`] with [`System::build`].
+/// [`System::foreign`] and managed files with [`System::file`] (all chainable
+/// and order-independent), then lower into a [`DesiredState`] with
+/// [`System::build`].
 #[derive(Debug, Default, Clone)]
 pub struct System {
     native: Vec<String>,
     foreign: Vec<String>,
+    files: Vec<ManagedFile>,
 }
 
 impl System {
@@ -47,19 +52,36 @@ impl System {
         self
     }
 
+    /// Declare a managed file at `path` whose content should be `content`
+    ///
+    /// Chainable and order-independent. Declaring the same path more than once is
+    /// last-wins: the final declaration's content is the one lowered into the
+    /// [`DesiredState`] (see [`System::build`]).
+    #[must_use]
+    pub fn file(mut self, path: impl Into<String>, content: impl Into<String>) -> Self {
+        self.files.push(ManagedFile {
+            path: path.into(),
+            content: content.into(),
+        });
+        self
+    }
+
     /// Lower the accumulated configuration into a [`DesiredState`]
     ///
-    /// Each origin is sorted and deduplicated so that authoring order and
+    /// Each package origin is sorted and deduplicated so that authoring order and
     /// accidental repeats do not affect the result. This mirrors how the planner
     /// already normalizes a plan, so an imported state and an authored state
     /// compare equal when they name the same packages.
+    ///
+    /// Managed files are likewise sorted by path and deduplicated by path so the
+    /// result is deterministic. Deduplication is last-wins: when a path is
+    /// declared more than once, the content of the final declaration is kept.
     #[must_use]
     pub fn build(self) -> DesiredState {
         DesiredState {
             native: sorted_unique(self.native),
             foreign: sorted_unique(self.foreign),
-            // File management is not authored through this package builder yet
-            files: Vec::new(),
+            files: sorted_unique_files(self.files),
         }
     }
 }
@@ -69,6 +91,22 @@ fn sorted_unique(mut pkgs: Vec<String>) -> Vec<String> {
     pkgs.sort();
     pkgs.dedup();
     pkgs
+}
+
+/// Sort managed files by path and deduplicate by path, keeping the last content
+///
+/// A [`BTreeMap`] keyed by path yields both properties at once: inserting an
+/// already-present path overwrites the earlier content (last-wins), and
+/// iteration is ordered by path (deterministic).
+fn sorted_unique_files(files: Vec<ManagedFile>) -> Vec<ManagedFile> {
+    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
+    for file in files {
+        by_path.insert(file.path, file.content);
+    }
+    by_path
+        .into_iter()
+        .map(|(path, content)| ManagedFile { path, content })
+        .collect()
 }
 
 #[cfg(test)]
@@ -126,5 +164,87 @@ mod tests {
 
         assert_eq!(desired.native, vec!["git".to_owned()]);
         assert_eq!(desired.foreign, vec!["yay".to_owned()]);
+    }
+
+    #[test]
+    fn file_declarations_are_accumulated_into_state() {
+        let desired = System::new()
+            .file("/etc/hostname", "gelbox\n")
+            .file("/etc/motd", "hello\n")
+            .build();
+
+        assert_eq!(
+            desired.files,
+            vec![
+                ManagedFile {
+                    path: "/etc/hostname".to_owned(),
+                    content: "gelbox\n".to_owned(),
+                },
+                ManagedFile {
+                    path: "/etc/motd".to_owned(),
+                    content: "hello\n".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_sorts_files_by_path_regardless_of_authoring_order() {
+        let desired = System::new()
+            .file("/z", "z")
+            .file("/a", "a")
+            .file("/m", "m")
+            .build();
+
+        let paths: Vec<&str> = desired.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a", "/m", "/z"]);
+    }
+
+    #[test]
+    fn duplicate_paths_are_last_wins() {
+        // declaring the same path twice keeps the final declaration's content
+        let desired = System::new()
+            .file("/etc/hostname", "first\n")
+            .file("/etc/hostname", "second\n")
+            .build();
+
+        assert_eq!(
+            desired.files,
+            vec![ManagedFile {
+                path: "/etc/hostname".to_owned(),
+                content: "second\n".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn files_mix_with_packages() {
+        // files and packages accumulate independently and both land in the state
+        let desired = System::new()
+            .native(["git"])
+            .foreign(["yay"])
+            .file("/etc/hostname", "gelbox\n")
+            .build();
+
+        assert_eq!(desired.native, vec!["git".to_owned()]);
+        assert_eq!(desired.foreign, vec!["yay".to_owned()]);
+        assert_eq!(
+            desired.files,
+            vec![ManagedFile {
+                path: "/etc/hostname".to_owned(),
+                content: "gelbox\n".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn file_accepts_both_str_and_string() {
+        // file is generic over Into<String> for both path and content
+        let desired = System::new()
+            .file("/etc/hostname".to_owned(), "gelbox\n")
+            .file("/etc/motd", "hi\n".to_owned())
+            .build();
+
+        assert_eq!(desired.files.len(), 2);
     }
 }
