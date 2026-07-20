@@ -27,9 +27,10 @@ fn run_gel(args: &[&str]) -> (bool, String) {
 fn system_commands_fast_fail_without_arch_feature() {
     // each system-touching subcommand must exit non-zero with the rebuild hint
     // and must not touch the host; a plain `cargo test` builds the pure binary.
-    // diff and apply now also plan managed file writes and service enable/disable
-    // actions, but that work lives behind the arch feature, so they must still
-    // fast-fail before any planning (no systemctl is ever invoked here)
+    // diff and apply now also plan managed file writes, service enable/disable
+    // actions, and system setting changes, but that work lives behind the arch
+    // feature, so they must still fast-fail before any planning (no systemctl,
+    // hostnamectl, timedatectl, or localectl is ever invoked here)
     for args in [
         vec!["diff"],
         vec!["apply"],
@@ -54,6 +55,14 @@ fn system_commands_fast_fail_without_arch_feature() {
         assert!(
             !out.contains("to enable") && !out.contains("to disable"),
             "`gel {}` must not plan services in the pure build, got: {out}",
+            args[0]
+        );
+        // settings planning also lives behind the arch feature: the pure build
+        // must fast-fail before reading any current setting, so the settings
+        // summary line must never appear either
+        assert!(
+            !out.contains("settings to change") && !out.contains("settings to restore"),
+            "`gel {}` must not plan settings in the pure build, got: {out}",
             args[0]
         );
     }

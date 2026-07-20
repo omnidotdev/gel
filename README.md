@@ -56,7 +56,10 @@ fn main() {
         // a managed file: gel writes this content verbatim on apply
         .file("/tmp/gel-demo.conf", "greeting = hello\n")
         .enable("systemd-timesyncd.service") // ensure a unit is enabled
-        .disable("bluetooth.service"); // ensure a unit is disabled
+        .disable("bluetooth.service") // ensure a unit is disabled
+        .hostname("gelbox") // manage the hostname
+        .timezone("Etc/UTC") // manage the timezone
+        .locale("en_US.UTF-8"); // manage the locale
     print!("{}", serde_json::to_string(&system.build()).expect("serialize"));
 }
 ```
@@ -104,6 +107,26 @@ Not yet handled (planned for later phases): unit masking, drop-in override files
 unit is currently running), and templated/instanced units. gel manages only the
 enable/disable state of the units you declare.
 
+### Managed system settings
+
+`System::hostname(name)`, `System::timezone(tz)`, and `System::locale(locale)`
+declare explicit intent over three global system settings, converged with
+`hostnamectl`, `timedatectl`, and `localectl` respectively. Like services, this is
+explicit intent, not full-set convergence: a setting you do not declare is left
+`None` and gel never touches it. Each setter is last-call-wins per field, so the
+final value for a given setting is the one lowered into the state.
+
+On `apply`, gel reads each declared setting's current value and changes only those
+that differ, recording each changed setting's prior value. On `rollback`, gel
+restores that prior value; a setting that had no prior value (it was previously
+unset) is left as-is rather than cleared, so rollback never invents an empty
+hostname, timezone, or locale.
+
+Not yet handled (planned for later phases): users and groups, `sysctl` kernel
+parameters, kernel modules, the console keymap and font, and locale categories
+beyond `LANG` (for example `LC_TIME` or `LC_MESSAGES`). gel manages only the
+hostname, timezone, and single `LANG` locale you declare.
+
 ### 2. Evaluate (pure, always available)
 
 `gel eval` compiles and runs the config crate and writes the desired state to an
@@ -118,22 +141,25 @@ gel eval examples/host-config --out /tmp/desired.json
 ### 3. Diff and apply (require an Arch build)
 
 ```sh
-gel diff                 # preview the plan: packages, files, and service changes (read-only)
-gel apply                # additive converge: install what is missing, write files, enable/disable units
+gel diff                 # preview the plan: packages, files, service, and setting changes (read-only)
+gel apply                # additive converge: install what is missing, write files, enable/disable units, change settings
 gel apply --prune        # also remove explicit packages absent from the config
 gel import               # capture the current explicit packages as a desired state
-gel rollback             # invert the most recent apply (packages + files + services)
+gel rollback             # invert the most recent apply (packages + files + services + settings)
 ```
 
 `diff` also lists the managed files whose content would change (`~N files to
-write` plus each target path) and the service actions (`+N to enable, -N to
-disable` plus each unit), and stays read-only. `apply` takes a filesystem
-snapshot first (via snapper on btrfs; it degrades to a warning when snapshots are
-unavailable), prints the plan, converges packages, writes managed files, applies
-the service enable/disable actions, and records a transaction in the journal so it
-can be rolled back. `rollback` reverses packages, restores managed files to their
-prior content, and restores each touched unit's prior enabled state; a full
-snapshot-based filesystem restore is planned for a later phase.
+write` plus each target path), the service actions (`+N to enable, -N to disable`
+plus each unit), and the setting changes (`~N settings to change` plus each
+setting), and stays read-only. `apply` takes a filesystem snapshot first (via
+snapper on btrfs; it degrades to a warning when snapshots are unavailable), prints
+the plan, converges packages, writes managed files, applies the service
+enable/disable actions, changes the settings, and records a transaction in the
+journal so it can be rolled back. `rollback` reverses packages, restores managed
+files to their prior content, restores each touched unit's prior enabled state,
+and restores each changed setting's prior value (a setting that was previously
+unset is left as-is); a full snapshot-based filesystem restore is planned for a
+later phase.
 
 ### The `arch` feature
 

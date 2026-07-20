@@ -24,7 +24,12 @@ fn main() {
         // its prior enabled state on rollback. `systemd-timesyncd.service` is a
         // stock systemd unit present on essentially every systemd host, so this is
         // a harmless, illustrative demo; swap it for the units you actually manage
-        .enable("systemd-timesyncd.service");
+        .enable("systemd-timesyncd.service")
+        // a system setting: gel converges the timezone on apply and restores the
+        // prior value on rollback. `Etc/UTC` is a universally valid timezone, so
+        // this is a harmless, illustrative demo; set your own hostname/timezone/
+        // locale (or drop this line) for a real machine
+        .timezone("Etc/UTC");
 
     // print the desired state as JSON on stdout for `gel eval` to capture
     let json = serde_json::to_string(&system.build()).expect("serialize desired state");

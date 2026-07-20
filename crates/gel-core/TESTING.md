@@ -26,13 +26,15 @@ is safe (it only runs cargo and writes a file, never touching packages):
 
 ```bash
 gel eval examples/host-config --out /tmp/desired.json
-cat /tmp/desired.json   # a DesiredState: sorted native + foreign, managed files, and services
+cat /tmp/desired.json   # a DesiredState: sorted native + foreign, managed files, services, and settings
 ```
 
 The example config declares one illustrative managed file
-(`/tmp/gel-demo.conf`) via `System::file` and one illustrative enabled unit
-(`systemd-timesyncd.service`) via `System::enable`, so the emitted artifact
-carries both a `files` entry and a `services.enable` entry. Managed-file behavior
+(`/tmp/gel-demo.conf`) via `System::file`, one illustrative enabled unit
+(`systemd-timesyncd.service`) via `System::enable`, and one illustrative setting
+(`timezone = Etc/UTC`) via `System::timezone`, so the emitted artifact carries a
+`files` entry, a `services.enable` entry, and a `settings.timezone` value.
+Managed-file behavior
 is covered end to end by pure unit tests (the `System` builder's sort/last-wins in
 `config.rs`, `plan_files` in `plan.rs`, `apply`'s read-before-write backups in
 `apply.rs`, and `rollback_last`'s restore/delete in `journal.rs`); the real
@@ -53,9 +55,27 @@ treats systemd's `enabled-runtime` state as enabled. The real `systemctl` calls
 live behind the `arch` feature (mock-runner unit tests plus the container), never
 against a developer host.
 
-Deferred for later phases (not yet handled): unit masking, drop-in override
-files, `--user` units, runtime start/stop state (gel manages enablement, not
-whether a unit is currently running), and templated/instanced units.
+Declarative system settings are covered end to end by the same style of pure unit
+tests: the `System` builder's per-field last-call-wins setters in `config.rs`;
+`plan_settings` in `plan.rs`; `apply`'s prior-value backups in `apply.rs`; and
+`rollback_last`'s setting restore in `journal.rs`. Declare intent with
+`System::hostname(name)`, `System::timezone(tz)`, and `System::locale(locale)`;
+each is last-call-wins per field, and a field left unset stays `None` so gel never
+touches it. On `apply` gel reads each declared setting's current value and changes
+only those that differ, recording each changed setting's prior value so `rollback`
+restores it. Rollback semantics: the prior value is restored; a setting that had
+no prior value (it was previously unset) is left as-is, so rollback never invents
+an empty hostname, timezone, or locale. The real `hostnamectl`/`timedatectl`/
+`localectl` calls live behind the `arch` feature (mock-runner unit tests in
+`arch.rs`, including argv construction, the non-zero-exit-as-unset path, and the
+runner-failure propagation path), never against a developer host.
+
+Deferred for later phases (not yet handled): for services, unit masking, drop-in
+override files, `--user` units, runtime start/stop state (gel manages enablement,
+not whether a unit is currently running), and templated/instanced units; for
+settings, users and groups, `sysctl` kernel parameters, kernel modules, the
+console keymap and font, and locale categories beyond `LANG` (for example
+`LC_TIME` or `LC_MESSAGES`).
 
 The real Arch backend (`ArchBackend`) and btrfs snapshot provider
 (`BtrfsSnapshot`) route all process execution through a `CommandRunner` seam, so

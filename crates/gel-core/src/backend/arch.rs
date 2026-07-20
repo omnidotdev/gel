@@ -341,6 +341,9 @@ mod tests {
         available: Vec<String>,
         output: CommandOutput,
         calls: CallLog,
+        // when set, `run` fails as if the process could not be spawned, so the
+        // backend's `?` error-propagation path can be exercised
+        run_fails: bool,
     }
 
     impl MockRunner {
@@ -353,6 +356,15 @@ mod tests {
                     stderr: stderr.to_owned(),
                 },
                 calls: Rc::new(RefCell::new(Vec::new())),
+                run_fails: false,
+            }
+        }
+
+        /// A runner whose `run` returns `Err`, mimicking a failed spawn
+        fn erroring() -> Self {
+            Self {
+                run_fails: true,
+                ..Self::default()
             }
         }
 
@@ -367,6 +379,14 @@ mod tests {
                 program.to_owned(),
                 args.iter().map(|a| (*a).to_owned()).collect(),
             ));
+            if self.run_fails {
+                // a genuine spawn failure surfaces as an I/O error, distinct from a
+                // process that ran and exited non-zero
+                return Err(GelError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "mock spawn failure",
+                )));
+            }
             Ok(self.output.clone())
         }
 
@@ -661,6 +681,18 @@ mod tests {
         let backend = ArchBackend::with_runner(runner);
 
         assert_eq!(backend.get(SettingKey::Hostname).expect("get"), None);
+    }
+
+    #[test]
+    fn get_setting_propagates_runner_failure() {
+        // a genuine runner failure (the reading tool could not be spawned) is a
+        // real error, distinct from a process that ran and exited non-zero, so it
+        // must propagate through `?` rather than be swallowed as unset
+        let backend = ArchBackend::with_runner(MockRunner::erroring());
+
+        let result = backend.get(SettingKey::Hostname);
+
+        assert!(matches!(result, Err(GelError::Io(_))));
     }
 
     #[test]
