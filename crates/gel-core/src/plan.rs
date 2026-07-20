@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    backend::file::FileBackend,
+    backend::{file::FileBackend, service::ServiceBackend},
     error::GelError,
     state::{DesiredState, ManagedFile},
 };
@@ -14,6 +14,12 @@ pub struct Plan {
     pub foreign_install: Vec<String>,
     pub foreign_remove: Vec<String>,
     pub file_writes: Vec<ManagedFile>,
+    /// Defaulted so journal entries predating the service model still deserialize
+    #[serde(default)]
+    pub service_enable: Vec<String>,
+    /// Defaulted so journal entries predating the service model still deserialize
+    #[serde(default)]
+    pub service_disable: Vec<String>,
 }
 
 impl Plan {
@@ -32,6 +38,10 @@ impl Plan {
             // File writes require reading current content, which is impure, so
             // they are planned separately via `plan_files`
             file_writes: Vec::new(),
+            // Service actions require querying unit state, which is impure, so
+            // they are planned separately via `plan_services`
+            service_enable: Vec::new(),
+            service_disable: Vec::new(),
         }
     }
 
@@ -43,6 +53,8 @@ impl Plan {
             && self.foreign_install.is_empty()
             && self.foreign_remove.is_empty()
             && self.file_writes.is_empty()
+            && self.service_enable.is_empty()
+            && self.service_disable.is_empty()
     }
 }
 
@@ -72,6 +84,60 @@ pub fn plan_files(
     Ok(writes)
 }
 
+/// Compute the service enable/disable actions needed to reach `desired`
+///
+/// Returns `(enable, disable)` where `enable` is the declared-enable units that
+/// are currently disabled and `disable` is the declared-disable units that are
+/// currently enabled. Both are sorted and deduplicated so the plan is
+/// deterministic, and a unit never appears in both lists.
+///
+/// This is explicit-intent planning, not full-set convergence: only units named
+/// in `desired.services` are ever considered, so a unit absent from both lists is
+/// left untouched and gel never disables a unit it was not told about.
+///
+/// Conflict rule: when a unit is declared in both `enable` and `disable`,
+/// **disable wins**. It is removed from the enable candidates and only ever
+/// disabled, so an ambiguous declaration can never leave a unit running.
+///
+/// # Errors
+///
+/// Returns [`GelError`] if the backend fails to query a unit.
+pub fn plan_services(
+    backend: &impl ServiceBackend,
+    desired: &DesiredState,
+) -> Result<(Vec<String>, Vec<String>), GelError> {
+    let disable_set: BTreeSet<&String> = desired.services.disable.iter().collect();
+
+    let mut enable = Vec::new();
+    for unit in &desired.services.enable {
+        // disable wins over an ambiguous enable/disable declaration
+        if disable_set.contains(unit) {
+            continue;
+        }
+        if !backend.is_enabled(unit)? {
+            enable.push(unit.clone());
+        }
+    }
+
+    let mut disable = Vec::new();
+    for unit in &desired.services.disable {
+        if backend.is_enabled(unit)? {
+            disable.push(unit.clone());
+        }
+    }
+
+    Ok((sorted_unique(enable), sorted_unique(disable)))
+}
+
+/// Sort a list of units and drop duplicates
+fn sorted_unique(units: Vec<String>) -> Vec<String> {
+    units
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Packages present in `from` but absent from `exclude`, sorted and deduplicated
 fn difference(from: &[String], exclude: &[String]) -> Vec<String> {
     let exclude: BTreeSet<&String> = exclude.iter().collect();
@@ -88,7 +154,7 @@ mod tests {
     use super::*;
     use crate::{
         backend::fake::FakeBackend,
-        state::{DesiredState, ManagedFile},
+        state::{DesiredState, ManagedFile, ServiceIntent},
     };
 
     fn desired_with_files(files: Vec<ManagedFile>) -> DesiredState {
@@ -96,7 +162,19 @@ mod tests {
             native: vec![],
             foreign: vec![],
             files,
-            services: crate::state::ServiceIntent::default(),
+            services: ServiceIntent::default(),
+        }
+    }
+
+    fn desired_with_services(enable: &[&str], disable: &[&str]) -> DesiredState {
+        DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                enable: enable.iter().map(|s| (*s).to_owned()).collect(),
+                disable: disable.iter().map(|s| (*s).to_owned()).collect(),
+            },
         }
     }
 
@@ -235,5 +313,107 @@ mod tests {
             vec!["bash".to_owned(), "zsh".to_owned()]
         );
         assert_eq!(plan.native_remove, vec!["git".to_owned(), "vim".to_owned()]);
+    }
+
+    #[test]
+    fn declared_enable_already_enabled_is_excluded() {
+        let backend = FakeBackend::with_enabled(&["sshd.service"]);
+        let desired = desired_with_services(&["sshd.service"], &[]);
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert!(enable.is_empty());
+        assert!(disable.is_empty());
+    }
+
+    #[test]
+    fn declared_enable_currently_disabled_is_included() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_services(&["sshd.service"], &[]);
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert_eq!(enable, vec!["sshd.service".to_owned()]);
+        assert!(disable.is_empty());
+    }
+
+    #[test]
+    fn declared_disable_currently_enabled_is_included() {
+        let backend = FakeBackend::with_enabled(&["bluetooth.service"]);
+        let desired = desired_with_services(&[], &["bluetooth.service"]);
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert!(enable.is_empty());
+        assert_eq!(disable, vec!["bluetooth.service".to_owned()]);
+    }
+
+    #[test]
+    fn declared_disable_already_disabled_is_excluded() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_services(&[], &["bluetooth.service"]);
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert!(enable.is_empty());
+        assert!(disable.is_empty());
+    }
+
+    #[test]
+    fn conflicting_unit_resolves_disable_wins() {
+        // A unit declared in both enable and disable is treated as a disable
+        // target only, and must never appear in the enable list
+        let backend = FakeBackend::with_enabled(&["conflict.service"]);
+        let desired = desired_with_services(&["conflict.service"], &["conflict.service"]);
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert!(enable.is_empty());
+        assert_eq!(disable, vec!["conflict.service".to_owned()]);
+    }
+
+    #[test]
+    fn conflicting_unit_currently_disabled_appears_in_neither() {
+        // Disable-wins removes the unit from the enable candidates, and since it
+        // is already disabled it is not a disable candidate either
+        let backend = FakeBackend::default();
+        let desired = desired_with_services(&["conflict.service"], &["conflict.service"]);
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert!(enable.is_empty());
+        assert!(disable.is_empty());
+    }
+
+    #[test]
+    fn service_plan_is_sorted_and_deduplicated() {
+        let backend = FakeBackend::with_enabled(&["b.service", "d.service"]);
+        let desired = desired_with_services(
+            &["c.service", "a.service", "a.service"],
+            &["d.service", "b.service", "b.service"],
+        );
+
+        let (enable, disable) = plan_services(&backend, &desired).expect("plan");
+
+        assert_eq!(enable, vec!["a.service".to_owned(), "c.service".to_owned()]);
+        assert_eq!(
+            disable,
+            vec!["b.service".to_owned(), "d.service".to_owned()]
+        );
+    }
+
+    #[test]
+    fn service_plan_counts_toward_is_empty() {
+        let enable_plan = Plan {
+            service_enable: vec!["sshd.service".to_owned()],
+            ..Plan::default()
+        };
+        assert!(!enable_plan.is_empty());
+
+        let disable_plan = Plan {
+            service_disable: vec!["bluetooth.service".to_owned()],
+            ..Plan::default()
+        };
+        assert!(!disable_plan.is_empty());
     }
 }
