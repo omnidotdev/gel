@@ -87,7 +87,7 @@ jobs:
           tar -czvf gel-${{ matrix.target }}.tar.gz gel
           mv gel-${{ matrix.target }}.tar.gz ../../../
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gel-${{ matrix.target }}
           path: gel-${{ matrix.target }}.tar.gz
@@ -106,7 +106,7 @@ jobs:
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Extract changelog for version
