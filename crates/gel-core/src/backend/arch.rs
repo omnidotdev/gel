@@ -7,6 +7,7 @@
 
 use std::{
     fs, io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -219,6 +220,22 @@ impl<R: CommandRunner> FileBackend for ArchBackend<R> {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn mode(&self, path: &str) -> Result<Option<u32>, GelError> {
+        match fs::metadata(path) {
+            // mask off the file-type bits so only the permission bits remain,
+            // matching the low-twelve-bit contract a declared mode compares against
+            Ok(meta) => Ok(Some(meta.permissions().mode() & 0o7777)),
+            // a missing file has no mode, mirroring read_file's None
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), GelError> {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        Ok(())
     }
 }
 

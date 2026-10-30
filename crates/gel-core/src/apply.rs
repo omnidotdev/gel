@@ -98,16 +98,30 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
         plan.foreign_remove.clear();
     }
 
-    // converge managed files after packages, capturing prior content per write
+    // converge managed files after packages, capturing prior content and mode per
+    // change so both the write and any mode correction can be rolled back
     let writes = plan_files(b, desired)?;
     let mut file_backups = Vec::with_capacity(writes.len());
     for file in &writes {
-        // read the prior content BEFORE overwriting so rollback can restore it
+        // read the prior content and mode BEFORE changing them so rollback can
+        // restore the exact prior bytes and permission bits
         let prior = b.read_file(&file.path)?;
-        b.write_file(&file.path, &file.content)?;
+        let prior_mode = b.mode(&file.path)?;
+        // write content only when it actually differs, so a mode-only change does
+        // not rewrite identical bytes or emit a spurious write
+        if prior.as_deref() != Some(file.content.as_str()) {
+            b.write_file(&file.path, &file.content)?;
+        }
+        // set the mode only when it is managed (Some) and differs from the current
+        if let Some(mode) = file.mode {
+            if prior_mode != Some(mode) {
+                b.set_mode(&file.path, mode)?;
+            }
+        }
         file_backups.push(FileBackup {
             path: file.path.clone(),
             prior,
+            prior_mode,
         });
     }
     plan.file_writes = writes;
@@ -186,6 +200,7 @@ mod tests {
         let desired = desired_files(vec![ManagedFile {
             path: "/etc/hostname".to_owned(),
             content: "gelbox\n".to_owned(),
+            ..Default::default()
         }]);
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -201,6 +216,7 @@ mod tests {
             vec![FileBackup {
                 path: "/etc/hostname".to_owned(),
                 prior: None,
+                prior_mode: None,
             }]
         );
         // the effective plan reflects what was written
@@ -220,6 +236,7 @@ mod tests {
         let desired = desired_files(vec![ManagedFile {
             path: "/etc/hostname".to_owned(),
             content: "new\n".to_owned(),
+            ..Default::default()
         }]);
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -235,6 +252,7 @@ mod tests {
             vec![FileBackup {
                 path: "/etc/hostname".to_owned(),
                 prior: Some("old\n".to_owned()),
+                prior_mode: None,
             }]
         );
     }
@@ -245,6 +263,7 @@ mod tests {
         let desired = desired_files(vec![ManagedFile {
             path: "/etc/hostname".to_owned(),
             content: "gelbox\n".to_owned(),
+            ..Default::default()
         }]);
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -257,6 +276,96 @@ mod tests {
                 .calls()
                 .iter()
                 .any(|call| matches!(call, Call::WriteFile(_)))
+        );
+    }
+
+    #[test]
+    fn apply_sets_declared_mode_and_backs_up_prior_mode() {
+        // content already matches but the mode differs, so the apply must correct
+        // the mode and record the prior mode, without rewriting the content
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        backend.set_file("/etc/exports", "x\n");
+        backend.set_file_mode("/etc/exports", 0o600);
+        let desired = desired_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            mode: Some(0o644),
+        }]);
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the mode is corrected on the backend
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), Some(0o644));
+        // a set_mode was issued but no content write, since the content matched
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetFileMode("/etc/exports".to_owned()))
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::WriteFile(_)))
+        );
+        // the prior mode is captured so rollback can restore it
+        assert_eq!(
+            applied.file_backups,
+            vec![FileBackup {
+                path: "/etc/exports".to_owned(),
+                prior: Some("x\n".to_owned()),
+                prior_mode: Some(0o600),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_creates_file_with_declared_mode_and_backs_up_none_prior_mode() {
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = desired_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            mode: Some(0o640),
+        }]);
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the file is created with both its content and the declared mode
+        assert_eq!(
+            backend.read_file("/etc/exports").expect("read"),
+            Some("x\n".to_owned())
+        );
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), Some(0o640));
+        // a newly created file records None for both prior content and prior mode,
+        // so rollback knows to delete it
+        assert_eq!(
+            applied.file_backups,
+            vec![FileBackup {
+                path: "/etc/exports".to_owned(),
+                prior: None,
+                prior_mode: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_with_unmanaged_mode_issues_no_set_mode() {
+        // a file with mode None manages content only, so even a content change must
+        // never touch the mode
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = desired_files(vec![ManagedFile {
+            path: "/etc/motd".to_owned(),
+            content: "hi\n".to_owned(),
+            mode: None,
+        }]);
+
+        apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::SetFileMode(_)))
         );
     }
 
@@ -533,10 +642,12 @@ mod tests {
                 ManagedFile {
                     path: "/etc/new".to_owned(),
                     content: "created\n".to_owned(),
+                    ..Default::default()
                 },
                 ManagedFile {
                     path: "/etc/changed".to_owned(),
                     content: "new\n".to_owned(),
+                    ..Default::default()
                 },
             ],
             services: ServiceIntent {

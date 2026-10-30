@@ -69,9 +69,11 @@ impl Plan {
 
 /// Compute the managed files that need a write to reach `desired`
 ///
-/// A desired file is included when it is absent on the backend or its current
-/// content differs from the desired content. Unlike [`Plan::compute`], this
-/// reads current state through `backend`, so it is kept out of the pure planner.
+/// A desired file is included when it is absent on the backend, its current
+/// content differs from the desired content, or it declares a mode that differs
+/// from the current one (a mode of `None` is unmanaged and never forces a write).
+/// Unlike [`Plan::compute`], this reads current state through `backend`, so it is
+/// kept out of the pure planner.
 /// This phase does not remove files, only writes. Results are ordered by path so
 /// the plan is deterministic regardless of authoring order.
 ///
@@ -85,7 +87,15 @@ pub fn plan_files(
     let mut writes = Vec::new();
     for file in &desired.files {
         let current = backend.read_file(&file.path)?;
-        if current.as_deref() != Some(file.content.as_str()) {
+        let content_differs = current.as_deref() != Some(file.content.as_str());
+        // a declared mode that differs from the current mode also warrants a write,
+        // so a mode-only correction is not silently skipped when content matches. A
+        // mode of None means gel does not manage the mode, so it never forces a write
+        let mode_differs = match file.mode {
+            Some(desired_mode) => backend.mode(&file.path)? != Some(desired_mode),
+            None => false,
+        };
+        if content_differs || mode_differs {
             writes.push(file.clone());
         }
     }
@@ -235,6 +245,7 @@ mod tests {
         let desired = desired_with_files(vec![ManagedFile {
             path: "/etc/hostname".to_owned(),
             content: "gelbox\n".to_owned(),
+            ..Default::default()
         }]);
 
         let writes = plan_files(&backend, &desired).expect("plan");
@@ -248,6 +259,7 @@ mod tests {
         let desired = desired_with_files(vec![ManagedFile {
             path: "/etc/hostname".to_owned(),
             content: "gelbox\n".to_owned(),
+            ..Default::default()
         }]);
 
         let writes = plan_files(&backend, &desired).expect("plan");
@@ -261,11 +273,61 @@ mod tests {
         let desired = desired_with_files(vec![ManagedFile {
             path: "/etc/hostname".to_owned(),
             content: "new\n".to_owned(),
+            ..Default::default()
         }]);
 
         let writes = plan_files(&backend, &desired).expect("plan");
 
         assert_eq!(writes, desired.files);
+    }
+
+    #[test]
+    fn file_with_matching_content_but_differing_mode_is_planned() {
+        // content already matches, but the declared mode differs from the current
+        // mode, so the file is still planned so the mode can be corrected
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_mode("/etc/exports", 0o600);
+        let desired = desired_with_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            mode: Some(0o644),
+        }]);
+
+        let writes = plan_files(&backend, &desired).expect("plan");
+
+        assert_eq!(writes, desired.files);
+    }
+
+    #[test]
+    fn file_with_matching_content_and_mode_is_not_planned() {
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_mode("/etc/exports", 0o644);
+        let desired = desired_with_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            mode: Some(0o644),
+        }]);
+
+        let writes = plan_files(&backend, &desired).expect("plan");
+
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn file_with_unmanaged_mode_and_matching_content_is_not_planned() {
+        // mode None means gel does not manage the mode, so a content match alone
+        // means nothing to do regardless of the file's actual mode on disk
+        let mut backend = FakeBackend::with_files(&[("/etc/motd", "hi\n")]);
+        backend.set_file_mode("/etc/motd", 0o600);
+        let desired = desired_with_files(vec![ManagedFile {
+            path: "/etc/motd".to_owned(),
+            content: "hi\n".to_owned(),
+            mode: None,
+        }]);
+
+        let writes = plan_files(&backend, &desired).expect("plan");
+
+        assert!(writes.is_empty());
     }
 
     #[test]
@@ -275,14 +337,17 @@ mod tests {
             ManagedFile {
                 path: "/z".to_owned(),
                 content: "z".to_owned(),
+                ..Default::default()
             },
             ManagedFile {
                 path: "/a".to_owned(),
                 content: "a".to_owned(),
+                ..Default::default()
             },
             ManagedFile {
                 path: "/m".to_owned(),
                 content: "m".to_owned(),
+                ..Default::default()
             },
         ]);
 
@@ -298,6 +363,7 @@ mod tests {
             file_writes: vec![ManagedFile {
                 path: "/a".to_owned(),
                 content: "a".to_owned(),
+                ..Default::default()
             }],
             ..Plan::default()
         };

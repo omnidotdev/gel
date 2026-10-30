@@ -65,6 +65,28 @@ impl System {
         self.files.push(ManagedFile {
             path: path.into(),
             content: content.into(),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Declare a managed file at `path` with `content` and permission bits `mode`
+    ///
+    /// Like [`System::file`] but also manages the file's mode (for example
+    /// `0o600` on a secret). Chainable and order-independent; declaring the same
+    /// path more than once is last-wins for both content and mode (see
+    /// [`System::build`]).
+    #[must_use]
+    pub fn file_mode(
+        mut self,
+        path: impl Into<String>,
+        content: impl Into<String>,
+        mode: u32,
+    ) -> Self {
+        self.files.push(ManagedFile {
+            path: path.into(),
+            content: content.into(),
+            mode: Some(mode),
         });
         self
     }
@@ -129,7 +151,8 @@ impl System {
     ///
     /// Managed files are likewise sorted by path and deduplicated by path so the
     /// result is deterministic. Deduplication is last-wins: when a path is
-    /// declared more than once, the content of the final declaration is kept.
+    /// declared more than once, the content and mode of the final declaration are
+    /// kept.
     ///
     /// Service intent is sorted and deduplicated per list. When a unit is named in
     /// both enable and disable, **disable wins**: it is dropped from the enable
@@ -175,20 +198,19 @@ fn sorted_unique(mut pkgs: Vec<String>) -> Vec<String> {
     pkgs
 }
 
-/// Sort managed files by path and deduplicate by path, keeping the last content
+/// Sort managed files by path and deduplicate by path, keeping the last file
 ///
 /// A [`BTreeMap`] keyed by path yields both properties at once: inserting an
-/// already-present path overwrites the earlier content (last-wins), and
-/// iteration is ordered by path (deterministic).
+/// already-present path overwrites the earlier declaration (last-wins), and
+/// iteration is ordered by path (deterministic). The whole [`ManagedFile`] is
+/// kept as the value, so the final declaration's content AND mode survive, rather
+/// than only its content.
 fn sorted_unique_files(files: Vec<ManagedFile>) -> Vec<ManagedFile> {
-    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
+    let mut by_path: BTreeMap<String, ManagedFile> = BTreeMap::new();
     for file in files {
-        by_path.insert(file.path, file.content);
+        by_path.insert(file.path.clone(), file);
     }
-    by_path
-        .into_iter()
-        .map(|(path, content)| ManagedFile { path, content })
-        .collect()
+    by_path.into_values().collect()
 }
 
 #[cfg(test)]
@@ -263,10 +285,12 @@ mod tests {
                 ManagedFile {
                     path: "/etc/hostname".to_owned(),
                     content: "gelbox\n".to_owned(),
+                    ..Default::default()
                 },
                 ManagedFile {
                     path: "/etc/motd".to_owned(),
                     content: "hello\n".to_owned(),
+                    ..Default::default()
                 },
             ]
         );
@@ -297,6 +321,7 @@ mod tests {
             vec![ManagedFile {
                 path: "/etc/hostname".to_owned(),
                 content: "second\n".to_owned(),
+                ..Default::default()
             }]
         );
     }
@@ -317,6 +342,7 @@ mod tests {
             vec![ManagedFile {
                 path: "/etc/hostname".to_owned(),
                 content: "gelbox\n".to_owned(),
+                ..Default::default()
             }]
         );
     }
@@ -330,6 +356,49 @@ mod tests {
             .build();
 
         assert_eq!(desired.files.len(), 2);
+    }
+
+    #[test]
+    fn file_mode_sets_the_declared_mode() {
+        let desired = System::new()
+            .file_mode("/etc/exports", "x\n", 0o644)
+            .build();
+
+        assert_eq!(
+            desired.files,
+            vec![ManagedFile {
+                path: "/etc/exports".to_owned(),
+                content: "x\n".to_owned(),
+                mode: Some(0o644),
+            }]
+        );
+    }
+
+    #[test]
+    fn plain_file_leaves_mode_unmanaged() {
+        // the plain file() builder declares no mode, leaving it unmanaged
+        let desired = System::new().file("/etc/motd", "hi\n").build();
+
+        assert_eq!(desired.files[0].mode, None);
+    }
+
+    #[test]
+    fn duplicate_path_last_wins_preserves_mode() {
+        // re-declaring a path keeps the final declaration's content AND mode, so a
+        // later file_mode is not silently dropped by deduplication
+        let desired = System::new()
+            .file("/etc/exports", "first\n")
+            .file_mode("/etc/exports", "second\n", 0o600)
+            .build();
+
+        assert_eq!(
+            desired.files,
+            vec![ManagedFile {
+                path: "/etc/exports".to_owned(),
+                content: "second\n".to_owned(),
+                mode: Some(0o600),
+            }]
+        );
     }
 
     #[test]

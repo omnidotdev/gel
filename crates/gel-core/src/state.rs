@@ -1,12 +1,21 @@
 use serde::{Deserialize, Serialize};
 
 /// A file whose full content is managed declaratively
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedFile {
     /// Absolute path the file should live at
     pub path: String,
     /// Exact content the file should hold
     pub content: String,
+    /// Desired permission bits, e.g. `0o644`, or `None` to leave the file's mode
+    /// unmanaged
+    ///
+    /// Only the low twelve bits (setuid, setgid, sticky, and the owner/group/other
+    /// rwx triples) are meaningful. Defaulted and skipped when absent so artifacts
+    /// predating file-mode management still deserialize, and a file with no
+    /// declared mode serializes exactly as it did before mode existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 /// Explicit intent over systemd units, expressed as two disjoint lists
@@ -115,6 +124,7 @@ mod tests {
             files: vec![ManagedFile {
                 path: "/etc/hostname".to_owned(),
                 content: "gelbox\n".to_owned(),
+                ..Default::default()
             }],
             services: ServiceIntent {
                 enable: vec!["sshd.service".to_owned()],
@@ -127,6 +137,47 @@ mod tests {
         let back: DesiredState = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(state, back);
+    }
+
+    #[test]
+    fn managed_file_mode_roundtrips() {
+        let file = ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "/srv 10.0.0.0/8(ro)\n".to_owned(),
+            mode: Some(0o644),
+        };
+
+        let json = serde_json::to_string(&file).expect("serialize");
+        let back: ManagedFile = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(file, back);
+        assert_eq!(back.mode, Some(0o644));
+    }
+
+    #[test]
+    fn managed_file_json_without_mode_deserializes_to_none() {
+        // a file artifact predating mode management carries no `mode` key and must
+        // still deserialize, leaving the mode unmanaged
+        let json = r#"{"path":"/etc/motd","content":"hi\n"}"#;
+
+        let file: ManagedFile = serde_json::from_str(json).expect("deserialize");
+
+        assert!(file.mode.is_none());
+    }
+
+    #[test]
+    fn managed_file_without_mode_omits_the_key() {
+        // skip_serializing_if keeps a mode-less file's JSON identical to how it
+        // serialized before mode existed, so upgrading churns no artifacts
+        let file = ManagedFile {
+            path: "/etc/motd".to_owned(),
+            content: "hi\n".to_owned(),
+            mode: None,
+        };
+
+        let json = serde_json::to_string(&file).expect("serialize");
+
+        assert!(!json.contains("mode"));
     }
 
     #[test]

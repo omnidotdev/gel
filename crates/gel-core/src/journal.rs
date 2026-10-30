@@ -34,6 +34,14 @@ pub struct FileBackup {
     pub path: String,
     /// The file's content before the apply, or `None` if it did not exist
     pub prior: Option<String>,
+    /// The file's permission bits before the apply, or `None` when the file did
+    /// not exist or its mode was not managed
+    ///
+    /// Defaulted so journal entries predating file-mode management still
+    /// deserialize cleanly as having no prior mode to restore. A `None` here on
+    /// rollback leaves the file's mode as-is rather than inventing one.
+    #[serde(default)]
+    pub prior_mode: Option<u32>,
 }
 
 /// The enabled-state of a systemd unit before an apply changed it
@@ -143,7 +151,9 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// installed, restores managed files to their pre-apply content, restores each
 /// toggled unit to its prior enabled-state, then restores each changed setting to
 /// its prior value. Each file backup is undone by writing back its prior content,
-/// or by deleting the file when the transaction created it (a `None` prior). Each
+/// or by deleting the file when the transaction created it (a `None` prior); when a
+/// prior mode was captured it is restored after the content, and a `None` prior
+/// mode is left as-is. Each
 /// service backup is undone by re-enabling a unit the apply disabled or disabling
 /// a unit it enabled. Each setting backup with a `Some` prior is set back to that
 /// value; a `None` prior is left as-is, because a scalar system setting cannot be
@@ -178,7 +188,16 @@ where
     // back, one with no prior was created by this transaction so it is deleted
     for backup in &entry.file_backups {
         match &backup.prior {
-            Some(old) => b.write_file(&backup.path, old)?,
+            Some(old) => {
+                b.write_file(&backup.path, old)?;
+                // restore the prior mode after rewriting the content, but only when
+                // a prior mode was captured. A None prior_mode means the mode was
+                // unmanaged (or the file was created by this transaction), so the
+                // mode is left as-is rather than inventing one
+                if let Some(mode) = backup.prior_mode {
+                    b.set_mode(&backup.path, mode)?;
+                }
+            }
             None => b.remove_file(&backup.path)?,
         }
     }
@@ -394,10 +413,12 @@ mod tests {
                 FileBackup {
                     path: "/etc/changed".to_owned(),
                     prior: Some("old\n".to_owned()),
+                    prior_mode: None,
                 },
                 FileBackup {
                     path: "/etc/new".to_owned(),
                     prior: None,
+                    prior_mode: None,
                 },
             ],
             service_backups: Vec::new(),
@@ -422,6 +443,74 @@ mod tests {
                 Call::RemoveFile("/etc/new".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn rollback_last_restores_prior_file_mode() {
+        // the recorded transaction changed /etc/exports' mode from 0o600 to 0o644
+        // with the content unchanged, so the post-apply backend holds mode 0o644
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_mode("/etc/exports", 0o644);
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: vec![FileBackup {
+                path: "/etc/exports".to_owned(),
+                prior: Some("x\n".to_owned()),
+                prior_mode: Some(0o600),
+            }],
+            service_backups: Vec::new(),
+            setting_backups: Vec::new(),
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // the mode is restored to its recorded prior value
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), Some(0o600));
+        // the restore issues a set_mode back to the prior mode
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetFileMode("/etc/exports".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rollback_last_leaves_mode_untouched_when_prior_mode_is_none() {
+        // a backup whose prior_mode is None (the mode was unmanaged, or the file was
+        // created by the transaction) must not issue a set_mode on rollback
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FakeBackend::with_files(&[("/etc/motd", "hi\n")]);
+        backend.set_file_mode("/etc/motd", 0o644);
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: vec![FileBackup {
+                path: "/etc/motd".to_owned(),
+                prior: Some("hi\n".to_owned()),
+                prior_mode: None,
+            }],
+            service_backups: Vec::new(),
+            setting_backups: Vec::new(),
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // no set_mode was issued, and the mode is left exactly as it was
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::SetFileMode(_)))
+        );
+        assert_eq!(backend.mode("/etc/motd").expect("mode"), Some(0o644));
     }
 
     #[test]

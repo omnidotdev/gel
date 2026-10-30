@@ -23,6 +23,8 @@ pub enum Call {
     WriteFile(String),
     /// `remove_file` was called for this path
     RemoveFile(String),
+    /// `set_mode` was called for this path
+    SetFileMode(String),
     /// `enable` was called for this unit
     EnableService(String),
     /// `disable` was called for this unit
@@ -44,6 +46,7 @@ pub struct FakeBackend {
     native: Vec<String>,
     foreign: Vec<String>,
     files: HashMap<String, String>,
+    file_modes: HashMap<String, u32>,
     services: HashMap<String, bool>,
     settings: HashMap<SettingKey, String>,
     calls: Vec<Call>,
@@ -97,6 +100,11 @@ impl FakeBackend {
     /// Seed or overwrite a single file's content without recording a call
     pub fn set_file(&mut self, path: &str, content: &str) {
         self.files.insert(path.to_owned(), content.to_owned());
+    }
+
+    /// Seed or overwrite a single file's mode without recording a call
+    pub fn set_file_mode(&mut self, path: &str, mode: u32) {
+        self.file_modes.insert(path.to_owned(), mode);
     }
 
     /// Return the ordered log of mutating calls made against this backend
@@ -233,6 +241,29 @@ impl FileBackend for FakeBackend {
             return Err(GelError::Backend("injected remove_file failure".to_owned()));
         }
         self.files.remove(path);
+        // a removed file carries no mode, so drop any tracked mode with it
+        self.file_modes.remove(path);
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn mode(&self, path: &str) -> Result<Option<u32>, GelError> {
+        // an absent file has no mode; a present file reports a stored mode only
+        // when one was set, so a file whose mode gel never managed reads back as
+        // None and a declared mode will plan a change
+        if !self.files.contains_key(path) {
+            return Ok(None);
+        }
+        Ok(self.file_modes.get(path).copied())
+    }
+
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), GelError> {
+        let call = Call::SetFileMode(path.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected set_mode failure".to_owned()));
+        }
+        self.file_modes.insert(path.to_owned(), mode);
         self.calls.push(call);
         Ok(())
     }
@@ -394,6 +425,70 @@ mod tests {
             backend.read_file("/etc/hostname").expect("read"),
             Some("gelbox\n".to_owned())
         );
+    }
+
+    #[test]
+    fn set_mode_records_call_and_mode_reads_back() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+
+        backend.set_mode("/etc/exports", 0o644).expect("set_mode");
+
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), Some(0o644));
+        assert_eq!(
+            backend.calls(),
+            &[Call::SetFileMode("/etc/exports".to_owned())]
+        );
+    }
+
+    #[test]
+    fn mode_is_none_for_absent_file() {
+        use crate::backend::file::FileBackend;
+
+        let backend = FakeBackend::default();
+
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), None);
+    }
+
+    #[test]
+    fn mode_is_none_for_present_file_without_a_set_mode() {
+        use crate::backend::file::FileBackend;
+
+        // a file whose content is known but whose mode was never set reads back as
+        // an unmanaged (None) mode, so a declared mode plans a change
+        let backend = FakeBackend::with_files(&[("/etc/motd", "hi\n")]);
+
+        assert_eq!(backend.mode("/etc/motd").expect("mode"), None);
+    }
+
+    #[test]
+    fn remove_file_clears_mode() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_mode("/etc/exports", 0o600).expect("set_mode");
+
+        backend.remove_file("/etc/exports").expect("remove");
+
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), None);
+    }
+
+    #[test]
+    fn injected_set_mode_failure_is_one_shot() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_fail_on(Call::SetFileMode(String::new()));
+
+        // first matching set_mode fails and does not mutate state
+        let first = backend.set_mode("/etc/exports", 0o644);
+        assert!(first.is_err());
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), None);
+
+        // the next matching set_mode succeeds now that the failure is consumed
+        backend.set_mode("/etc/exports", 0o644).expect("set_mode");
+        assert_eq!(backend.mode("/etc/exports").expect("mode"), Some(0o644));
     }
 
     #[test]

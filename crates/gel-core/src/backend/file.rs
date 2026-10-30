@@ -26,4 +26,22 @@ pub trait FileBackend {
     ///
     /// Returns [`GelError`] if the backend fails to remove the file.
     fn remove_file(&mut self, path: &str) -> Result<(), GelError>;
+
+    /// Return the current permission bits of `path`, or `None` if it is absent
+    ///
+    /// Only the low twelve permission bits are reported (any file-type bits are
+    /// masked off), so the value compares directly against a declared
+    /// [`ManagedFile::mode`](crate::state::ManagedFile::mode).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to stat the file.
+    fn mode(&self, path: &str) -> Result<Option<u32>, GelError>;
+
+    /// Set the permission bits of `path` to `mode`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to change the file's mode.
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), GelError>;
 }

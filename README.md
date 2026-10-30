@@ -100,6 +100,8 @@ fn main() {
         .foreign(["some-aur-pkg"]) // AUR packages (installed via paru)
         // a managed file: gel writes this content verbatim on apply
         .file("/tmp/gel-demo.conf", "greeting = hello\n")
+        // a managed file with explicit permission bits (e.g. 0o600 on a secret)
+        .file_mode("/tmp/gel-secret.conf", "token = xyz\n", 0o600)
         .enable("systemd-timesyncd.service") // ensure a unit is enabled
         .disable("bluetooth.service") // ensure a unit is disabled
         .hostname("gelbox") // manage the hostname
@@ -111,7 +113,8 @@ fn main() {
 
 `System::build()` sorts and deduplicates each package list, so authoring order
 does not matter. Managed files are likewise sorted by path and deduplicated by
-path; declaring the same path twice is last-wins (the final content is kept).
+path; declaring the same path twice is last-wins (the final content and mode are
+kept).
 Service enable/disable lists are sorted and deduplicated too, with disable
 winning any enable/disable conflict for the same unit.
 
@@ -125,10 +128,16 @@ is returned to its exact prior bytes. Writes are atomic (written to a temp
 sibling then renamed into place), so a crash mid-write cannot leave a partially
 written config.
 
+`System::file_mode(path, content, mode)` additionally manages the file's
+permission bits (for example `0o600` on a secret). On `apply`, gel sets the mode
+whenever it differs from the file's current mode, even if the content already
+matches, and records the prior mode so `rollback` restores it; a file declared
+with plain `file` leaves its mode unmanaged (`None`) and gel never touches it.
+
 Not yet handled (planned for later phases): file pruning (removing a file just
-because it left the config), file permissions and ownership, content templating,
+because it left the config), file ownership (user and group), content templating,
 and drift detection against package-provided default config files. gel manages
-only the files you declare, by full content.
+only the files you declare, by full content and optional mode.
 
 ### Managed services
 
