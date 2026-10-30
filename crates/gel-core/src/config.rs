@@ -24,6 +24,7 @@ pub struct System {
     enable: Vec<String>,
     disable: Vec<String>,
     start: Vec<String>,
+    stop: Vec<String>,
     settings: SettingsIntent,
     sysctl: Vec<SysctlParam>,
 }
@@ -153,6 +154,17 @@ impl System {
         self
     }
 
+    /// Declare that `unit` should be inactive (stopped)
+    ///
+    /// Chainable and order-independent. The runtime counterpart to
+    /// [`System::start`]; when a unit is declared both started and stopped, stop
+    /// wins and the unit is never started (see [`System::build`]).
+    #[must_use]
+    pub fn stop(mut self, unit: impl Into<String>) -> Self {
+        self.stop.push(unit.into());
+        self
+    }
+
     /// Declare that kernel parameter `name` should be set to `value` (sysctl)
     ///
     /// Chainable and order-independent. Declaring the same name more than once is
@@ -224,7 +236,7 @@ impl System {
             native: sorted_unique(self.native),
             foreign: sorted_unique(self.foreign),
             files: sorted_unique_files(self.files),
-            services: build_services(self.enable, self.disable, self.start),
+            services: build_services(self.enable, self.disable, self.start, self.stop),
             settings: self.settings,
             sysctl: sorted_unique_sysctl(self.sysctl),
         }
@@ -236,19 +248,32 @@ impl System {
 /// Each list is sorted and deduplicated, and disable wins over a conflicting
 /// enable: a unit present in both lists is removed from enable so the result
 /// never names a unit in both.
-fn build_services(enable: Vec<String>, disable: Vec<String>, start: Vec<String>) -> ServiceIntent {
+fn build_services(
+    enable: Vec<String>,
+    disable: Vec<String>,
+    start: Vec<String>,
+    stop: Vec<String>,
+) -> ServiceIntent {
     let disable = sorted_unique(disable);
     let disable_set: BTreeSet<&String> = disable.iter().collect();
     let enable = sorted_unique(enable)
         .into_iter()
         .filter(|unit| !disable_set.contains(unit))
         .collect();
-    // start is an independent runtime axis (not boot-time enablement), so it is
-    // sorted and deduplicated but not filtered against disable
+    // runtime is an independent axis from boot-time enablement. Within runtime,
+    // stop wins over a conflicting start, mirroring the enable/disable rule, so a
+    // unit named in both is only ever stopped
+    let stop = sorted_unique(stop);
+    let stop_set: BTreeSet<&String> = stop.iter().collect();
+    let start = sorted_unique(start)
+        .into_iter()
+        .filter(|unit| !stop_set.contains(unit))
+        .collect();
     ServiceIntent {
         enable,
         disable,
-        start: sorted_unique(start),
+        start,
+        stop,
     }
 }
 
@@ -603,6 +628,22 @@ mod tests {
             vec!["a.service".to_owned(), "c.service".to_owned()]
         );
         assert_eq!(desired.services.enable, vec!["a.service".to_owned()]);
+    }
+
+    #[test]
+    fn stop_declares_inactive_and_wins_over_start() {
+        let desired = System::new()
+            .start("a.service")
+            .stop("a.service")
+            .stop("b.service")
+            .build();
+
+        // stop wins the conflict: a.service is only stopped, never started
+        assert!(desired.services.start.is_empty());
+        assert_eq!(
+            desired.services.stop,
+            vec!["a.service".to_owned(), "b.service".to_owned()]
+        );
     }
 
     #[test]

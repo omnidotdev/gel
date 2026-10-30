@@ -70,9 +70,11 @@ pub fn diff(artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // diff stays read-only
     plan.setting_changes =
         plan_settings(&backend, &desired).context("failed to plan setting changes")?;
-    // surface units to start; this queries active state but changes nothing
-    plan.service_start =
-        plan_runtime(&backend, &desired).context("failed to plan service starts")?;
+    // surface units to start/stop; this queries active state but changes nothing
+    let (service_start, service_stop) =
+        plan_runtime(&backend, &desired).context("failed to plan service runtime")?;
+    plan.service_start = service_start;
+    plan.service_stop = service_stop;
     // surface sysctl changes; this reads current values but changes nothing
     plan.sysctl_changes =
         plan_sysctl(&backend, &desired).context("failed to plan sysctl changes")?;
@@ -154,10 +156,12 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // must be previewed and must not be treated as "nothing to apply"
     preview.setting_changes =
         plan_settings(&backend, &desired).context("failed to plan setting changes")?;
-    // include pending starts so a start-only change is previewed and not treated
-    // as "nothing to apply"
-    preview.service_start =
-        plan_runtime(&backend, &desired).context("failed to plan service starts")?;
+    // include pending starts/stops so a runtime-only change is previewed and not
+    // treated as "nothing to apply"
+    let (service_start, service_stop) =
+        plan_runtime(&backend, &desired).context("failed to plan service runtime")?;
+    preview.service_start = service_start;
+    preview.service_stop = service_stop;
     // include pending sysctl changes so a sysctl-only change is not "nothing to apply"
     preview.sysctl_changes =
         plan_sysctl(&backend, &desired).context("failed to plan sysctl changes")?;

@@ -160,19 +160,20 @@ unit's prior enabled state, so `rollback` restores it: a unit gel enabled is
 disabled again, and a unit gel disabled is re-enabled. `is_enabled` treats
 systemd's `enabled-runtime` state as enabled.
 
-`System::start(unit)` declares that a unit should be active (running) now, an axis
-independent of enablement: a unit can be enabled (starts at boot) without being
-active yet, and vice versa. On `apply`, gel starts each declared-start unit that is
-not already active and records its prior active-state, so `rollback` stops a unit it
-started. `is_active` treats only systemd's `active` state as active. This is what
-makes `.enable("incus.service").start("incus.service")` bring a freshly installed
-service up immediately, not just at next boot.
+`System::start(unit)` and `System::stop(unit)` declare that a unit should be active
+(running) or inactive now, an axis independent of enablement: a unit can be enabled
+(starts at boot) without being active yet, and vice versa. When a unit is declared
+both started and stopped, stop wins (mirroring disable). On `apply`, gel starts each
+declared-start unit that is not already active and stops each declared-stop unit that
+is, recording each toggled unit's prior active-state so `rollback` undoes it.
+`is_active` treats only systemd's `active` state as active. This is what makes
+`.enable("incus.service").start("incus.service")` bring a freshly installed service
+up immediately, not just at next boot.
 
 Not yet handled (planned for later phases): unit masking, drop-in override files,
-`--user` units, declaring that a unit should be stopped (gel can start a unit but
-not yet stop one as declarative intent), restart-on-config-change notifications, and
-templated/instanced units. gel manages the enable/disable state of the units you
-declare, and can additionally start them.
+`--user` units, restart-on-config-change notifications, and templated/instanced
+units. gel manages the enable/disable state of the units you declare and can start
+or stop them.
 
 ### Managed system settings
 

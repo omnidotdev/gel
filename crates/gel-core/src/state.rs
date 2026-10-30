@@ -66,6 +66,12 @@ pub struct ServiceIntent {
     /// predating runtime management still deserialize with nothing to start.
     #[serde(default)]
     pub start: Vec<String>,
+    /// Units to ensure are inactive (stopped), stopped if currently active
+    ///
+    /// The runtime counterpart to `start`. When a unit is named in both, stop
+    /// wins (it is never started), mirroring the enable/disable conflict rule.
+    #[serde(default)]
+    pub stop: Vec<String>,
 }
 
 /// A single global system setting gel can manage declaratively

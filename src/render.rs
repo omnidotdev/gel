@@ -39,7 +39,8 @@ pub fn print_plan(plan: &Plan) {
     let enable = plan.service_enable.len();
     let disable = plan.service_disable.len();
     let start = plan.service_start.len();
-    println!("+{enable} to enable, -{disable} to disable, ~{start} to start");
+    let stop = plan.service_stop.len();
+    println!("+{enable} to enable, -{disable} to disable, ~{start} to start, ~{stop} to stop");
     for unit in &plan.service_enable {
         println!("  + {unit} (service)");
     }
@@ -48,6 +49,9 @@ pub fn print_plan(plan: &Plan) {
     }
     for unit in &plan.service_start {
         println!("  ~ {unit} (service, start)");
+    }
+    for unit in &plan.service_stop {
+        println!("  ~ {unit} (service, stop)");
     }
 
     let settings = plan.setting_changes.len();

@@ -123,10 +123,11 @@ fn converge_files<B: FileBackend>(
 /// transaction can restore it. The toggled units populate `plan.service_enable`
 /// and `plan.service_disable` so the effective plan reflects them.
 ///
-/// After enablement, runtime state converges: each declared-start unit
-/// (`desired.services.start`) that is not already active is started, with its prior
-/// active-state recorded as a [`RuntimeBackup`] so rollback can stop a unit the
-/// transaction started. Started units populate `plan.service_start`.
+/// After enablement, runtime state converges: each declared-start unit not already
+/// active is started and each declared-stop unit that is active is stopped, with
+/// each toggled unit's prior active-state recorded as a [`RuntimeBackup`] so
+/// rollback can undo the toggle. The toggles populate
+/// `plan.service_start`/`service_stop`.
 ///
 /// After services, declared settings converge: only settings named in
 /// `desired.settings` are considered, and for each setting whose current value
@@ -205,10 +206,10 @@ pub fn apply<
     plan.service_disable = disable;
 
     // converge runtime (active) state after enablement: start each declared-start
-    // unit that is not already active, capturing its prior active-state so rollback
-    // can stop the ones this transaction started
-    let start = plan_runtime(b, desired)?;
-    let mut runtime_backups = Vec::with_capacity(start.len());
+    // unit that is not already active and stop each declared-stop unit that is,
+    // capturing each unit's prior active-state so rollback can undo the toggle
+    let (start, stop) = plan_runtime(b, desired)?;
+    let mut runtime_backups = Vec::with_capacity(start.len() + stop.len());
     for unit in &start {
         let prior_active = b.is_active(unit)?;
         b.start(unit)?;
@@ -217,7 +218,16 @@ pub fn apply<
             prior_active,
         });
     }
+    for unit in &stop {
+        let prior_active = b.is_active(unit)?;
+        b.stop(unit)?;
+        runtime_backups.push(RuntimeBackup {
+            unit: unit.clone(),
+            prior_active,
+        });
+    }
     plan.service_start = start;
+    plan.service_stop = stop;
 
     // converge declared settings after services, capturing prior value per change.
     // plan_settings only returns settings whose current value differs, so every
@@ -606,6 +616,53 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Call::StartService(_)))
         );
+    }
+
+    #[test]
+    fn apply_stops_declared_active_unit_then_rollback_restarts_it() {
+        use crate::journal::{JournalEntry, rollback_last, write_entry};
+
+        let mut backend = FakeBackend::with_active(&["bluetooth.service"]);
+        let desired = DesiredState {
+            services: ServiceIntent {
+                stop: vec!["bluetooth.service".to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the unit is now inactive, its prior active-state recorded
+        assert!(!backend.is_active("bluetooth.service").expect("query"));
+        assert_eq!(
+            applied.plan.service_stop,
+            vec!["bluetooth.service".to_owned()]
+        );
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::StopService("bluetooth.service".to_owned()))
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: applied.plan,
+            snapshot: None,
+            file_backups: applied.file_backups,
+            service_backups: applied.service_backups,
+            setting_backups: applied.setting_backups,
+            runtime_backups: applied.runtime_backups,
+            sysctl_backups: applied.sysctl_backups,
+        };
+        write_entry(dir.path(), &entry).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // rollback restarts the unit the transaction stopped
+        assert!(backend.is_active("bluetooth.service").expect("query"));
     }
 
     #[test]

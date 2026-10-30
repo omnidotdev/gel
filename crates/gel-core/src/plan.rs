@@ -28,6 +28,11 @@ pub struct Plan {
     /// Defaulted so journal entries predating runtime management still deserialize
     #[serde(default)]
     pub service_start: Vec<String>,
+    /// Units to stop (ensure inactive)
+    ///
+    /// Defaulted so journal entries predating runtime management still deserialize
+    #[serde(default)]
+    pub service_stop: Vec<String>,
     /// Settings to change, as `(key, desired value)` pairs
     ///
     /// Defaulted so journal entries predating the settings model still deserialize
@@ -60,9 +65,10 @@ impl Plan {
             // they are planned separately via `plan_services`
             service_enable: Vec::new(),
             service_disable: Vec::new(),
-            // Runtime start actions require querying active state, which is impure,
-            // so they are planned separately via `plan_runtime`
+            // Runtime start/stop actions require querying active state, which is
+            // impure, so they are planned separately via `plan_runtime`
             service_start: Vec::new(),
+            service_stop: Vec::new(),
             // Setting changes require reading current values, which is impure, so
             // they are planned separately via `plan_settings`
             setting_changes: Vec::new(),
@@ -83,6 +89,7 @@ impl Plan {
             && self.service_enable.is_empty()
             && self.service_disable.is_empty()
             && self.service_start.is_empty()
+            && self.service_stop.is_empty()
             && self.setting_changes.is_empty()
             && self.sysctl_changes.is_empty()
     }
@@ -180,13 +187,15 @@ pub fn plan_services(
     Ok((sorted_unique(enable), sorted_unique(disable)))
 }
 
-/// Compute the units to start to reach `desired`
+/// Compute the runtime start/stop actions needed to reach `desired`
 ///
-/// Returns the declared-start units that are currently inactive, sorted and
-/// deduplicated. Like [`plan_services`], this is explicit-intent planning: only
-/// units named in `desired.services.start` are ever considered, and a unit already
-/// active is skipped. Starting is an independent axis from enablement, so a unit
-/// may be both enabled and started.
+/// Returns `(start, stop)` where `start` is the declared-start units currently
+/// inactive and `stop` is the declared-stop units currently active, each sorted
+/// and deduplicated. Explicit-intent planning: only units named in
+/// `desired.services.start`/`stop` are considered. Runtime is an independent axis
+/// from enablement (a unit may be both enabled and started). Conflict rule: a unit
+/// declared both start and stop is only stopped (stop wins), so it never appears
+/// in `start`.
 ///
 /// # Errors
 ///
@@ -194,14 +203,28 @@ pub fn plan_services(
 pub fn plan_runtime(
     backend: &impl ServiceBackend,
     desired: &DesiredState,
-) -> Result<Vec<String>, GelError> {
+) -> Result<(Vec<String>, Vec<String>), GelError> {
+    let stop_set: BTreeSet<&String> = desired.services.stop.iter().collect();
+
     let mut start = Vec::new();
     for unit in &desired.services.start {
+        // stop wins over an ambiguous start/stop declaration
+        if stop_set.contains(unit) {
+            continue;
+        }
         if !backend.is_active(unit)? {
             start.push(unit.clone());
         }
     }
-    Ok(sorted_unique(start))
+
+    let mut stop = Vec::new();
+    for unit in &desired.services.stop {
+        if backend.is_active(unit)? {
+            stop.push(unit.clone());
+        }
+    }
+
+    Ok((sorted_unique(start), sorted_unique(stop)))
 }
 
 /// Compute the setting changes needed to reach `desired`
@@ -333,6 +356,17 @@ mod tests {
             },
             settings: SettingsIntent::default(),
             sysctl: Vec::new(),
+        }
+    }
+
+    fn desired_with_runtime(start: &[&str], stop: &[&str]) -> DesiredState {
+        DesiredState {
+            services: ServiceIntent {
+                start: start.iter().map(|s| (*s).to_owned()).collect(),
+                stop: stop.iter().map(|s| (*s).to_owned()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
@@ -714,7 +748,7 @@ mod tests {
         let backend = FakeBackend::default();
         let desired = desired_with_start(&["nfs-server.service"]);
 
-        let start = plan_runtime(&backend, &desired).expect("plan");
+        let (start, _stop) = plan_runtime(&backend, &desired).expect("plan");
 
         assert_eq!(start, vec!["nfs-server.service".to_owned()]);
     }
@@ -724,7 +758,7 @@ mod tests {
         let backend = FakeBackend::with_active(&["nfs-server.service"]);
         let desired = desired_with_start(&["nfs-server.service"]);
 
-        let start = plan_runtime(&backend, &desired).expect("plan");
+        let (start, _stop) = plan_runtime(&backend, &desired).expect("plan");
 
         assert!(start.is_empty());
     }
@@ -734,7 +768,7 @@ mod tests {
         let backend = FakeBackend::default();
         let desired = desired_with_start(&["c.service", "a.service", "a.service"]);
 
-        let start = plan_runtime(&backend, &desired).expect("plan");
+        let (start, _stop) = plan_runtime(&backend, &desired).expect("plan");
 
         assert_eq!(start, vec!["a.service".to_owned(), "c.service".to_owned()]);
     }
@@ -743,6 +777,49 @@ mod tests {
     fn service_start_counts_toward_is_empty() {
         let plan = Plan {
             service_start: vec!["nfs-server.service".to_owned()],
+            ..Plan::default()
+        };
+
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn declared_stop_currently_active_is_included() {
+        let backend = FakeBackend::with_active(&["bluetooth.service"]);
+        let desired = desired_with_runtime(&[], &["bluetooth.service"]);
+
+        let (start, stop) = plan_runtime(&backend, &desired).expect("plan");
+
+        assert!(start.is_empty());
+        assert_eq!(stop, vec!["bluetooth.service".to_owned()]);
+    }
+
+    #[test]
+    fn declared_stop_already_inactive_is_excluded() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_runtime(&[], &["bluetooth.service"]);
+
+        let (_start, stop) = plan_runtime(&backend, &desired).expect("plan");
+
+        assert!(stop.is_empty());
+    }
+
+    #[test]
+    fn runtime_conflict_resolves_stop_wins() {
+        // a unit declared both start and stop is only ever stopped, never started
+        let backend = FakeBackend::with_active(&["conflict.service"]);
+        let desired = desired_with_runtime(&["conflict.service"], &["conflict.service"]);
+
+        let (start, stop) = plan_runtime(&backend, &desired).expect("plan");
+
+        assert!(start.is_empty());
+        assert_eq!(stop, vec!["conflict.service".to_owned()]);
+    }
+
+    #[test]
+    fn service_stop_counts_toward_is_empty() {
+        let plan = Plan {
+            service_stop: vec!["bluetooth.service".to_owned()],
             ..Plan::default()
         };
 
