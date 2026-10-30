@@ -20,6 +20,11 @@ pub struct Plan {
     /// Defaulted so journal entries predating the service model still deserialize
     #[serde(default)]
     pub service_disable: Vec<String>,
+    /// Units to start (ensure active)
+    ///
+    /// Defaulted so journal entries predating runtime management still deserialize
+    #[serde(default)]
+    pub service_start: Vec<String>,
     /// Settings to change, as `(key, desired value)` pairs
     ///
     /// Defaulted so journal entries predating the settings model still deserialize
@@ -47,6 +52,9 @@ impl Plan {
             // they are planned separately via `plan_services`
             service_enable: Vec::new(),
             service_disable: Vec::new(),
+            // Runtime start actions require querying active state, which is impure,
+            // so they are planned separately via `plan_runtime`
+            service_start: Vec::new(),
             // Setting changes require reading current values, which is impure, so
             // they are planned separately via `plan_settings`
             setting_changes: Vec::new(),
@@ -63,6 +71,7 @@ impl Plan {
             && self.file_writes.is_empty()
             && self.service_enable.is_empty()
             && self.service_disable.is_empty()
+            && self.service_start.is_empty()
             && self.setting_changes.is_empty()
     }
 }
@@ -159,6 +168,30 @@ pub fn plan_services(
     Ok((sorted_unique(enable), sorted_unique(disable)))
 }
 
+/// Compute the units to start to reach `desired`
+///
+/// Returns the declared-start units that are currently inactive, sorted and
+/// deduplicated. Like [`plan_services`], this is explicit-intent planning: only
+/// units named in `desired.services.start` are ever considered, and a unit already
+/// active is skipped. Starting is an independent axis from enablement, so a unit
+/// may be both enabled and started.
+///
+/// # Errors
+///
+/// Returns [`GelError`] if the backend fails to query a unit's active state.
+pub fn plan_runtime(
+    backend: &impl ServiceBackend,
+    desired: &DesiredState,
+) -> Result<Vec<String>, GelError> {
+    let mut start = Vec::new();
+    for unit in &desired.services.start {
+        if !backend.is_active(unit)? {
+            start.push(unit.clone());
+        }
+    }
+    Ok(sorted_unique(start))
+}
+
 /// Compute the setting changes needed to reach `desired`
 ///
 /// Returns the declared settings whose current value differs from the desired
@@ -237,6 +270,19 @@ mod tests {
         }
     }
 
+    fn desired_with_start(start: &[&str]) -> DesiredState {
+        DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                start: start.iter().map(|s| (*s).to_owned()).collect(),
+                ..Default::default()
+            },
+            settings: SettingsIntent::default(),
+        }
+    }
+
     fn desired_with_services(enable: &[&str], disable: &[&str]) -> DesiredState {
         DesiredState {
             native: vec![],
@@ -245,6 +291,7 @@ mod tests {
             services: ServiceIntent {
                 enable: enable.iter().map(|s| (*s).to_owned()).collect(),
                 disable: disable.iter().map(|s| (*s).to_owned()).collect(),
+                ..Default::default()
             },
             settings: SettingsIntent::default(),
         }
@@ -601,6 +648,46 @@ mod tests {
             ..Plan::default()
         };
         assert!(!disable_plan.is_empty());
+    }
+
+    #[test]
+    fn declared_start_currently_inactive_is_included() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_start(&["nfs-server.service"]);
+
+        let start = plan_runtime(&backend, &desired).expect("plan");
+
+        assert_eq!(start, vec!["nfs-server.service".to_owned()]);
+    }
+
+    #[test]
+    fn declared_start_already_active_is_excluded() {
+        let backend = FakeBackend::with_active(&["nfs-server.service"]);
+        let desired = desired_with_start(&["nfs-server.service"]);
+
+        let start = plan_runtime(&backend, &desired).expect("plan");
+
+        assert!(start.is_empty());
+    }
+
+    #[test]
+    fn runtime_plan_is_sorted_and_deduplicated() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_start(&["c.service", "a.service", "a.service"]);
+
+        let start = plan_runtime(&backend, &desired).expect("plan");
+
+        assert_eq!(start, vec!["a.service".to_owned(), "c.service".to_owned()]);
+    }
+
+    #[test]
+    fn service_start_counts_toward_is_empty() {
+        let plan = Plan {
+            service_start: vec!["nfs-server.service".to_owned()],
+            ..Plan::default()
+        };
+
+        assert!(!plan.is_empty());
     }
 
     #[test]

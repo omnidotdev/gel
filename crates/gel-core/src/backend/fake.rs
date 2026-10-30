@@ -33,6 +33,10 @@ pub enum Call {
     EnableService(String),
     /// `disable` was called for this unit
     DisableService(String),
+    /// `start` was called for this unit
+    StartService(String),
+    /// `stop` was called for this unit
+    StopService(String),
     /// `set` was called for this setting with this value
     SetSetting(SettingKey, String),
 }
@@ -54,6 +58,7 @@ pub struct FakeBackend {
     file_owners: HashMap<String, String>,
     file_groups: HashMap<String, String>,
     services: HashMap<String, bool>,
+    active: HashMap<String, bool>,
     settings: HashMap<SettingKey, String>,
     calls: Vec<Call>,
     fail_on: Option<Call>,
@@ -87,6 +92,15 @@ impl FakeBackend {
     pub fn with_enabled(units: &[&str]) -> Self {
         Self {
             services: units.iter().map(|u| ((*u).to_owned(), true)).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Construct a backend seeded with the given units marked active (running)
+    #[must_use]
+    pub fn with_active(units: &[&str]) -> Self {
+        Self {
+            active: units.iter().map(|u| ((*u).to_owned(), true)).collect(),
             ..Self::default()
         }
     }
@@ -349,6 +363,33 @@ impl ServiceBackend for FakeBackend {
             return Err(GelError::Backend("injected disable failure".to_owned()));
         }
         self.services.insert(unit.to_owned(), false);
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn is_active(&self, unit: &str) -> Result<bool, GelError> {
+        // an unknown unit is treated as not active, mirroring is_enabled
+        Ok(self.active.get(unit).copied().unwrap_or(false))
+    }
+
+    fn start(&mut self, unit: &str) -> Result<(), GelError> {
+        let call = Call::StartService(unit.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected start failure".to_owned()));
+        }
+        self.active.insert(unit.to_owned(), true);
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn stop(&mut self, unit: &str) -> Result<(), GelError> {
+        let call = Call::StopService(unit.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected stop failure".to_owned()));
+        }
+        self.active.insert(unit.to_owned(), false);
         self.calls.push(call);
         Ok(())
     }
@@ -685,6 +726,71 @@ mod tests {
         // the next matching enable succeeds now that the failure is consumed
         backend.enable("sshd.service").expect("enable");
         assert!(backend.is_enabled("sshd.service").expect("query"));
+    }
+
+    #[test]
+    fn start_marks_unit_active_and_records_call() {
+        use crate::backend::service::ServiceBackend;
+
+        let mut backend = FakeBackend::default();
+
+        backend.start("nfs-server.service").expect("start");
+
+        assert!(backend.is_active("nfs-server.service").expect("query"));
+        assert_eq!(
+            backend.calls(),
+            &[Call::StartService("nfs-server.service".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stop_marks_unit_inactive_and_records_call() {
+        use crate::backend::service::ServiceBackend;
+
+        let mut backend = FakeBackend::with_active(&["nfs-server.service"]);
+
+        backend.stop("nfs-server.service").expect("stop");
+
+        assert!(!backend.is_active("nfs-server.service").expect("query"));
+        assert_eq!(
+            backend.calls(),
+            &[Call::StopService("nfs-server.service".to_owned())]
+        );
+    }
+
+    #[test]
+    fn unknown_unit_is_not_active() {
+        use crate::backend::service::ServiceBackend;
+
+        let backend = FakeBackend::default();
+
+        assert!(!backend.is_active("unknown.service").expect("query"));
+    }
+
+    #[test]
+    fn enabled_and_active_are_independent() {
+        use crate::backend::service::ServiceBackend;
+
+        // a unit can be enabled (boot) without being active (now)
+        let backend = FakeBackend::with_enabled(&["sshd.service"]);
+
+        assert!(backend.is_enabled("sshd.service").expect("query"));
+        assert!(!backend.is_active("sshd.service").expect("query"));
+    }
+
+    #[test]
+    fn injected_start_failure_is_one_shot() {
+        use crate::backend::service::ServiceBackend;
+
+        let mut backend = FakeBackend::default();
+        backend.set_fail_on(Call::StartService(String::new()));
+
+        let first = backend.start("nfs-server.service");
+        assert!(first.is_err());
+        assert!(!backend.is_active("nfs-server.service").expect("query"));
+
+        backend.start("nfs-server.service").expect("start");
+        assert!(backend.is_active("nfs-server.service").expect("query"));
     }
 
     #[test]

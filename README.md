@@ -160,10 +160,19 @@ unit's prior enabled state, so `rollback` restores it: a unit gel enabled is
 disabled again, and a unit gel disabled is re-enabled. `is_enabled` treats
 systemd's `enabled-runtime` state as enabled.
 
+`System::start(unit)` declares that a unit should be active (running) now, an axis
+independent of enablement: a unit can be enabled (starts at boot) without being
+active yet, and vice versa. On `apply`, gel starts each declared-start unit that is
+not already active and records its prior active-state, so `rollback` stops a unit it
+started. `is_active` treats only systemd's `active` state as active. This is what
+makes `.enable("incus.service").start("incus.service")` bring a freshly installed
+service up immediately, not just at next boot.
+
 Not yet handled (planned for later phases): unit masking, drop-in override files,
-`--user` units, runtime start/stop state (gel manages enablement, not whether a
-unit is currently running), and templated/instanced units. gel manages only the
-enable/disable state of the units you declare.
+`--user` units, declaring that a unit should be stopped (gel can start a unit but
+not yet stop one as declarative intent), restart-on-config-change notifications, and
+templated/instanced units. gel manages the enable/disable state of the units you
+declare, and can additionally start them.
 
 ### Managed system settings
 

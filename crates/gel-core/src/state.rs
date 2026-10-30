@@ -46,6 +46,13 @@ pub struct ServiceIntent {
     /// Units to ensure are disabled
     #[serde(default)]
     pub disable: Vec<String>,
+    /// Units to ensure are active (running), started if currently inactive
+    ///
+    /// Distinct from `enable`: enablement controls whether a unit starts at boot,
+    /// while this controls whether it is running now. Defaulted so artifacts
+    /// predating runtime management still deserialize with nothing to start.
+    #[serde(default)]
+    pub start: Vec<String>,
 }
 
 /// A single global system setting gel can manage declaratively
@@ -144,6 +151,7 @@ mod tests {
             services: ServiceIntent {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec!["bluetooth.service".to_owned()],
+                ..Default::default()
             },
             settings: SettingsIntent::default(),
         };

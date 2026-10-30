@@ -6,7 +6,7 @@ use gel_core::plan::Plan;
 ///
 /// When the plan carries managed file writes, they are summarized as
 /// `~N files to write` and each target path is listed. Service intent is
-/// summarized as `+N to enable, -N to disable` on a second line with each unit
+/// summarized as `+N to enable, -N to disable, ~N to start` on a second line with each unit
 /// listed, and setting changes as `~N settings to change` on a third line with
 /// each key/value listed. A plan produced by [`Plan::compute`] alone carries no
 /// file writes, service actions, or setting changes (those require reading
@@ -37,12 +37,16 @@ pub fn print_plan(plan: &Plan) {
 
     let enable = plan.service_enable.len();
     let disable = plan.service_disable.len();
-    println!("+{enable} to enable, -{disable} to disable");
+    let start = plan.service_start.len();
+    println!("+{enable} to enable, -{disable} to disable, ~{start} to start");
     for unit in &plan.service_enable {
         println!("  + {unit} (service)");
     }
     for unit in &plan.service_disable {
         println!("  - {unit} (service)");
+    }
+    for unit in &plan.service_start {
+        println!("  ~ {unit} (service, start)");
     }
 
     let settings = plan.setting_changes.len();

@@ -87,8 +87,22 @@ pub struct SettingBackup {
     pub prior: Option<String>,
 }
 
+/// The active-state of a systemd unit before an apply started it
+///
+/// Recorded per unit the transaction actually started, mirroring [`ServiceBackup`]
+/// but for runtime (active) state rather than boot-time enablement. `prior_active`
+/// is whether the unit was running before the apply, so a unit the transaction
+/// started records `false` (stop it to undo).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeBackup {
+    /// Name of the unit that was started
+    pub unit: String,
+    /// Whether the unit was active before the apply started it
+    pub prior_active: bool,
+}
+
 /// A single recorded transaction: the plan that was applied and its snapshot
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
     /// Caller-injected transaction id, also used as the journal file name
     pub id: String,
@@ -116,6 +130,12 @@ pub struct JournalEntry {
     /// no such field) still deserialize cleanly as having changed no settings.
     #[serde(default)]
     pub setting_backups: Vec<SettingBackup>,
+    /// Prior active-state of every unit this transaction started
+    ///
+    /// Defaulted so journal entries predating runtime management still deserialize
+    /// cleanly as having started no units.
+    #[serde(default)]
+    pub runtime_backups: Vec<RuntimeBackup>,
 }
 
 /// Write `entry` as JSON to `dir`, named by its id, creating `dir` if needed
@@ -166,7 +186,8 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// prior mode was captured it is restored after the content, and a `None` prior
 /// mode is left as-is. Each
 /// service backup is undone by re-enabling a unit the apply disabled or disabling
-/// a unit it enabled. Each setting backup with a `Some` prior is set back to that
+/// a unit it enabled. Each runtime backup is undone by stopping a unit the apply
+/// started (or starting one it stopped). Each setting backup with a `Some` prior is set back to that
 /// value; a `None` prior is left as-is, because a scalar system setting cannot be
 /// meaningfully unset. A missing or empty journal is a no-op.
 ///
@@ -225,6 +246,15 @@ where
             b.enable(&backup.unit)?;
         } else {
             b.disable(&backup.unit)?;
+        }
+    }
+    // restore runtime state after enablement: a unit the apply started is stopped
+    // again (prior inactive), and one it stopped is started again (prior active)
+    for backup in &entry.runtime_backups {
+        if backup.prior_active {
+            b.start(&backup.unit)?;
+        } else {
+            b.stop(&backup.unit)?;
         }
     }
     // restore settings last: a backup with a prior value is set back to it. A
@@ -287,6 +317,7 @@ mod tests {
             file_backups: Vec::new(),
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -442,6 +473,7 @@ mod tests {
             ],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -484,6 +516,7 @@ mod tests {
             }],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -519,6 +552,7 @@ mod tests {
             }],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -556,6 +590,7 @@ mod tests {
             }],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -602,6 +637,7 @@ mod tests {
             }],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -643,6 +679,7 @@ mod tests {
                 },
             ],
             setting_backups: Vec::new(),
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -679,6 +716,7 @@ mod tests {
                 key: SettingKey::Hostname,
                 prior: Some("old".to_owned()),
             }],
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 
@@ -714,6 +752,7 @@ mod tests {
                 key: SettingKey::Timezone,
                 prior: None,
             }],
+            ..Default::default()
         };
         write_entry(dir.path(), &recorded).expect("write");
 

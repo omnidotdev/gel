@@ -23,6 +23,7 @@ pub struct System {
     files: Vec<ManagedFile>,
     enable: Vec<String>,
     disable: Vec<String>,
+    start: Vec<String>,
     settings: SettingsIntent,
 }
 
@@ -140,6 +141,17 @@ impl System {
         self
     }
 
+    /// Declare that `unit` should be active (running)
+    ///
+    /// Chainable and order-independent; repeats are collapsed by [`System::build`].
+    /// Independent of [`System::enable`]: enablement is boot-time, this is runtime,
+    /// so a unit can be both enabled and started, or started without being enabled.
+    #[must_use]
+    pub fn start(mut self, unit: impl Into<String>) -> Self {
+        self.start.push(unit.into());
+        self
+    }
+
     /// Declare the desired hostname
     ///
     /// Chainable and last-call-wins: the final call sets the managed hostname.
@@ -198,7 +210,7 @@ impl System {
             native: sorted_unique(self.native),
             foreign: sorted_unique(self.foreign),
             files: sorted_unique_files(self.files),
-            services: build_services(self.enable, self.disable),
+            services: build_services(self.enable, self.disable, self.start),
             settings: self.settings,
         }
     }
@@ -209,14 +221,20 @@ impl System {
 /// Each list is sorted and deduplicated, and disable wins over a conflicting
 /// enable: a unit present in both lists is removed from enable so the result
 /// never names a unit in both.
-fn build_services(enable: Vec<String>, disable: Vec<String>) -> ServiceIntent {
+fn build_services(enable: Vec<String>, disable: Vec<String>, start: Vec<String>) -> ServiceIntent {
     let disable = sorted_unique(disable);
     let disable_set: BTreeSet<&String> = disable.iter().collect();
     let enable = sorted_unique(enable)
         .into_iter()
         .filter(|unit| !disable_set.contains(unit))
         .collect();
-    ServiceIntent { enable, disable }
+    // start is an independent runtime axis (not boot-time enablement), so it is
+    // sorted and deduplicated but not filtered against disable
+    ServiceIntent {
+        enable,
+        disable,
+        start: sorted_unique(start),
+    }
 }
 
 /// Sort a package list and drop duplicates
@@ -529,6 +547,34 @@ mod tests {
             desired.services.disable,
             vec!["conflict.service".to_owned()]
         );
+    }
+
+    #[test]
+    fn start_declares_a_unit_to_be_active() {
+        let desired = System::new().start("nfs-server.service").build();
+
+        assert_eq!(
+            desired.services.start,
+            vec!["nfs-server.service".to_owned()]
+        );
+    }
+
+    #[test]
+    fn start_is_sorted_deduplicated_and_independent_of_enable() {
+        let desired = System::new()
+            .enable("a.service")
+            .start("c.service")
+            .start("a.service")
+            .start("a.service")
+            .build();
+
+        // start is sorted/deduplicated and does not interfere with enable; a unit
+        // can be both enabled and started
+        assert_eq!(
+            desired.services.start,
+            vec!["a.service".to_owned(), "c.service".to_owned()]
+        );
+        assert_eq!(desired.services.enable, vec!["a.service".to_owned()]);
     }
 
     #[test]

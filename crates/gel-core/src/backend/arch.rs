@@ -304,6 +304,34 @@ impl<R: CommandRunner> ServiceBackend for ArchBackend<R> {
     fn disable(&mut self, unit: &str) -> Result<(), GelError> {
         self.run_checked("systemctl", &["disable", unit], "unit disable")
     }
+
+    fn is_active(&self, unit: &str) -> Result<bool, GelError> {
+        let output = self.runner.run("systemctl", &["is-active", unit])?;
+        // `systemctl is-active` prints the state to stdout and exits non-zero for
+        // any state other than active. A non-zero exit that still names a state is
+        // a legitimate not-active result; only a non-zero exit with no state on
+        // stdout (a diagnostic on stderr) is a real error, mirroring is_enabled.
+        // stderr is for server-side logs only, never surfaced to users
+        let state = output.stdout.trim();
+        if state.is_empty() {
+            if output.success {
+                return Ok(false);
+            }
+            let stderr = output.stderr.trim();
+            return Err(GelError::Backend(format!(
+                "unit active-state query failed: {stderr}"
+            )));
+        }
+        Ok(state == "active")
+    }
+
+    fn start(&mut self, unit: &str) -> Result<(), GelError> {
+        self.run_checked("systemctl", &["start", unit], "unit start")
+    }
+
+    fn stop(&mut self, unit: &str) -> Result<(), GelError> {
+        self.run_checked("systemctl", &["stop", unit], "unit stop")
+    }
 }
 
 /// Extract a setting's current value from its reading command's stdout
@@ -658,6 +686,74 @@ mod tests {
         let result = backend.enable("missing.service");
 
         assert!(matches!(result, Err(GelError::Backend(_))));
+    }
+
+    #[test]
+    fn is_active_true_for_active_state() {
+        let runner = MockRunner::new(true, "active\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert!(backend.is_active("nfs-server.service").expect("query"));
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "systemctl".to_owned(),
+                owned(&["is-active", "nfs-server.service"])
+            )]
+        );
+    }
+
+    #[test]
+    fn is_active_false_for_inactive_nonzero_exit() {
+        // `systemctl is-active` prints "inactive" and exits non-zero; a legitimate
+        // not-active result rather than a failure
+        let runner = MockRunner::new(false, "inactive\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        assert!(!backend.is_active("nfs-server.service").expect("query"));
+    }
+
+    #[test]
+    fn is_active_errors_when_nonzero_exit_prints_no_state() {
+        let runner = MockRunner::new(false, "", "Failed to connect to bus", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        assert!(matches!(
+            backend.is_active("x.service"),
+            Err(GelError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn start_builds_systemctl_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.start("nfs-server.service").expect("start");
+
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "systemctl".to_owned(),
+                owned(&["start", "nfs-server.service"])
+            )]
+        );
+    }
+
+    #[test]
+    fn stop_builds_systemctl_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.stop("nfs-server.service").expect("stop");
+
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "systemctl".to_owned(),
+                owned(&["stop", "nfs-server.service"])
+            )]
+        );
     }
 
     #[test]

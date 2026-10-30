@@ -30,4 +30,25 @@ pub trait ServiceBackend {
     ///
     /// Returns [`GelError`] if the backend fails to disable the unit.
     fn disable(&mut self, unit: &str) -> Result<(), GelError>;
+
+    /// Return whether `unit` is currently active (running)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to query the unit.
+    fn is_active(&self, unit: &str) -> Result<bool, GelError>;
+
+    /// Start `unit`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to start the unit.
+    fn start(&mut self, unit: &str) -> Result<(), GelError>;
+
+    /// Stop `unit`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to stop the unit.
+    fn stop(&mut self, unit: &str) -> Result<(), GelError>;
 }

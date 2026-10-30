@@ -3,8 +3,8 @@ use crate::{
         PackageBackend, file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
     },
     error::GelError,
-    journal::{FileBackup, ServiceBackup, SettingBackup},
-    plan::{Plan, plan_files, plan_services, plan_settings},
+    journal::{FileBackup, RuntimeBackup, ServiceBackup, SettingBackup},
+    plan::{Plan, plan_files, plan_runtime, plan_services, plan_settings},
     state::DesiredState,
 };
 
@@ -36,6 +36,8 @@ pub struct Applied {
     pub service_backups: Vec<ServiceBackup>,
     /// Prior value of each setting changed, so it can be rolled back
     pub setting_backups: Vec<SettingBackup>,
+    /// Prior active-state of each unit started, so it can be rolled back
+    pub runtime_backups: Vec<RuntimeBackup>,
 }
 
 /// Reconcile a backend toward `desired`, returning what was applied
@@ -62,6 +64,11 @@ pub struct Applied {
 /// recorded as a [`ServiceBackup`] before it is enabled or disabled, so the
 /// transaction can restore it. The toggled units populate `plan.service_enable`
 /// and `plan.service_disable` so the effective plan reflects them.
+///
+/// After enablement, runtime state converges: each declared-start unit
+/// (`desired.services.start`) that is not already active is started, with its prior
+/// active-state recorded as a [`RuntimeBackup`] so rollback can stop a unit the
+/// transaction started. Started units populate `plan.service_start`.
 ///
 /// After services, declared settings converge: only settings named in
 /// `desired.settings` are considered, and for each setting whose current value
@@ -167,6 +174,21 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
     plan.service_enable = enable;
     plan.service_disable = disable;
 
+    // converge runtime (active) state after enablement: start each declared-start
+    // unit that is not already active, capturing its prior active-state so rollback
+    // can stop the ones this transaction started
+    let start = plan_runtime(b, desired)?;
+    let mut runtime_backups = Vec::with_capacity(start.len());
+    for unit in &start {
+        let prior_active = b.is_active(unit)?;
+        b.start(unit)?;
+        runtime_backups.push(RuntimeBackup {
+            unit: unit.clone(),
+            prior_active,
+        });
+    }
+    plan.service_start = start;
+
     // converge declared settings after services, capturing prior value per change.
     // plan_settings only returns settings whose current value differs, so every
     // entry here genuinely changes and is worth backing up
@@ -185,6 +207,7 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
         file_backups,
         service_backups,
         setting_backups,
+        runtime_backups,
     })
 }
 
@@ -196,7 +219,7 @@ mod tests {
             PackageBackend, fake::Call, fake::FakeBackend, file::FileBackend,
             service::ServiceBackend, settings::SettingsBackend,
         },
-        journal::{FileBackup, ServiceBackup, SettingBackup},
+        journal::{FileBackup, RuntimeBackup, ServiceBackup, SettingBackup},
         state::{DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent},
     };
 
@@ -470,6 +493,110 @@ mod tests {
     }
 
     #[test]
+    fn apply_starts_declared_inactive_unit_and_backs_up_prior() {
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                start: vec!["nfs-server.service".to_owned()],
+                ..Default::default()
+            },
+            settings: SettingsIntent::default(),
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // the unit is now active on the backend
+        assert!(backend.is_active("nfs-server.service").expect("query"));
+        // its prior inactive state is recorded so rollback can stop it
+        assert_eq!(
+            applied.runtime_backups,
+            vec![RuntimeBackup {
+                unit: "nfs-server.service".to_owned(),
+                prior_active: false,
+            }]
+        );
+        // the effective plan reflects the start
+        assert_eq!(
+            applied.plan.service_start,
+            vec!["nfs-server.service".to_owned()]
+        );
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::StartService("nfs-server.service".to_owned()))
+        );
+    }
+
+    #[test]
+    fn apply_skips_already_active_unit() {
+        let mut backend = FakeBackend::with_active(&["nfs-server.service"]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                start: vec!["nfs-server.service".to_owned()],
+                ..Default::default()
+            },
+            settings: SettingsIntent::default(),
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // an already-active unit is neither started nor backed up
+        assert!(applied.runtime_backups.is_empty());
+        assert!(applied.plan.service_start.is_empty());
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::StartService(_)))
+        );
+    }
+
+    #[test]
+    fn apply_then_rollback_stops_a_unit_it_started() {
+        use crate::journal::{JournalEntry, rollback_last, write_entry};
+
+        // the apply starts nfs (prior inactive); rollback must stop it again
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = DesiredState {
+            native: vec![],
+            foreign: vec![],
+            files: vec![],
+            services: ServiceIntent {
+                start: vec!["nfs-server.service".to_owned()],
+                ..Default::default()
+            },
+            settings: SettingsIntent::default(),
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+        assert!(backend.is_active("nfs-server.service").expect("query"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: applied.plan,
+            snapshot: None,
+            file_backups: applied.file_backups,
+            service_backups: applied.service_backups,
+            setting_backups: applied.setting_backups,
+            runtime_backups: applied.runtime_backups,
+        };
+        write_entry(dir.path(), &entry).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // the unit the transaction started is stopped again
+        assert!(!backend.is_active("nfs-server.service").expect("query"));
+    }
+
+    #[test]
     fn apply_enables_declared_disabled_unit_and_backs_up_prior() {
         let mut backend = FakeBackend::with_explicit(&[], &[]);
         let desired = DesiredState {
@@ -479,6 +606,7 @@ mod tests {
             services: ServiceIntent {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec![],
+                ..Default::default()
             },
             settings: SettingsIntent::default(),
         };
@@ -517,6 +645,7 @@ mod tests {
             services: ServiceIntent {
                 enable: vec![],
                 disable: vec!["bluetooth.service".to_owned()],
+                ..Default::default()
             },
             settings: SettingsIntent::default(),
         };
@@ -558,6 +687,7 @@ mod tests {
             services: ServiceIntent {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec!["bluetooth.service".to_owned()],
+                ..Default::default()
             },
             settings: SettingsIntent::default(),
         };
@@ -707,6 +837,7 @@ mod tests {
             file_backups: applied.file_backups,
             service_backups: applied.service_backups,
             setting_backups: applied.setting_backups,
+            ..Default::default()
         };
         write_entry(dir.path(), &entry).expect("write");
 
@@ -753,6 +884,7 @@ mod tests {
             services: ServiceIntent {
                 enable: vec!["sshd.service".to_owned()],
                 disable: vec!["bluetooth.service".to_owned()],
+                ..Default::default()
             },
             settings: SettingsIntent {
                 hostname: Some("gelbox".to_owned()),
@@ -807,6 +939,7 @@ mod tests {
             file_backups: applied.file_backups,
             service_backups: applied.service_backups,
             setting_backups: applied.setting_backups,
+            ..Default::default()
         };
         write_entry(dir.path(), &entry).expect("write");
 
@@ -914,6 +1047,7 @@ mod tests {
             file_backups: applied.file_backups,
             service_backups: applied.service_backups,
             setting_backups: applied.setting_backups,
+            ..Default::default()
         };
         write_entry(dir.path(), &entry).expect("write");
 
