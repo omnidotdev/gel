@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    backend::{file::FileBackend, service::ServiceBackend, settings::SettingsBackend},
+    backend::{
+        file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
+        sysctl::SysctlBackend,
+    },
     error::GelError,
-    state::{DesiredState, ManagedFile, SettingKey},
+    state::{DesiredState, ManagedFile, SettingKey, SysctlParam},
 };
 
 /// A deterministic set of package and file changes to reconcile current with desired
@@ -30,6 +33,11 @@ pub struct Plan {
     /// Defaulted so journal entries predating the settings model still deserialize
     #[serde(default)]
     pub setting_changes: Vec<(SettingKey, String)>,
+    /// Sysctl parameters to change
+    ///
+    /// Defaulted so journal entries predating sysctl management still deserialize
+    #[serde(default)]
+    pub sysctl_changes: Vec<SysctlParam>,
 }
 
 impl Plan {
@@ -58,6 +66,9 @@ impl Plan {
             // Setting changes require reading current values, which is impure, so
             // they are planned separately via `plan_settings`
             setting_changes: Vec::new(),
+            // Sysctl changes require reading current values too, planned via
+            // `plan_sysctl`
+            sysctl_changes: Vec::new(),
         }
     }
 
@@ -73,6 +84,7 @@ impl Plan {
             && self.service_disable.is_empty()
             && self.service_start.is_empty()
             && self.setting_changes.is_empty()
+            && self.sysctl_changes.is_empty()
     }
 }
 
@@ -222,6 +234,29 @@ pub fn plan_settings(
     Ok(changes)
 }
 
+/// Compute the sysctl parameters to change to reach `desired`
+///
+/// Returns the declared params whose current value differs from the desired value
+/// (including when the param is unset or unreadable on the backend). Explicit
+/// intent: only params named in `desired.sysctl` are considered.
+///
+/// # Errors
+///
+/// Returns [`GelError`] if the backend fails to read a parameter.
+pub fn plan_sysctl(
+    backend: &impl SysctlBackend,
+    desired: &DesiredState,
+) -> Result<Vec<SysctlParam>, GelError> {
+    let mut changes = Vec::new();
+    for param in &desired.sysctl {
+        let current = backend.get(&param.name)?;
+        if current.as_deref() != Some(param.value.as_str()) {
+            changes.push(param.clone());
+        }
+    }
+    Ok(changes)
+}
+
 /// Sort a list of units and drop duplicates
 fn sorted_unique(units: Vec<String>) -> Vec<String> {
     units
@@ -247,8 +282,23 @@ mod tests {
     use super::*;
     use crate::{
         backend::fake::FakeBackend,
-        state::{DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent},
+        state::{
+            DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent, SysctlParam,
+        },
     };
+
+    fn desired_with_sysctl(params: &[(&str, &str)]) -> DesiredState {
+        DesiredState {
+            sysctl: params
+                .iter()
+                .map(|(name, value)| SysctlParam {
+                    name: (*name).to_owned(),
+                    value: (*value).to_owned(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
 
     fn desired_with_settings(settings: SettingsIntent) -> DesiredState {
         DesiredState {
@@ -257,6 +307,7 @@ mod tests {
             files: vec![],
             services: ServiceIntent::default(),
             settings,
+            sysctl: Vec::new(),
         }
     }
 
@@ -267,6 +318,7 @@ mod tests {
             files,
             services: ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         }
     }
 
@@ -280,6 +332,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         }
     }
 
@@ -294,6 +347,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         }
     }
 
@@ -490,6 +544,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
         let desired = DesiredState {
             native: vec!["git".to_owned(), "ripgrep".to_owned()],
@@ -497,6 +552,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let plan = Plan::compute(&current, &desired);
@@ -515,6 +571,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let plan = Plan::compute(&state, &state);
@@ -530,6 +587,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
         let desired = DesiredState {
             native: vec!["zsh".to_owned(), "bash".to_owned(), "bash".to_owned()],
@@ -537,6 +595,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let plan = Plan::compute(&current, &desired);
@@ -769,6 +828,55 @@ mod tests {
     fn setting_changes_count_toward_is_empty() {
         let plan = Plan {
             setting_changes: vec![(SettingKey::Hostname, "gelbox".to_owned())],
+            ..Plan::default()
+        };
+
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn declared_sysctl_differing_is_included() {
+        let backend = FakeBackend::with_sysctl(&[("net.ipv4.ip_forward", "0")]);
+        let desired = desired_with_sysctl(&[("net.ipv4.ip_forward", "1")]);
+
+        let changes = plan_sysctl(&backend, &desired).expect("plan");
+
+        assert_eq!(
+            changes,
+            vec![SysctlParam {
+                name: "net.ipv4.ip_forward".to_owned(),
+                value: "1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn declared_sysctl_matching_is_excluded() {
+        let backend = FakeBackend::with_sysctl(&[("net.ipv4.ip_forward", "1")]);
+        let desired = desired_with_sysctl(&[("net.ipv4.ip_forward", "1")]);
+
+        let changes = plan_sysctl(&backend, &desired).expect("plan");
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn declared_sysctl_unset_on_backend_is_included() {
+        let backend = FakeBackend::default();
+        let desired = desired_with_sysctl(&[("net.ipv4.ip_forward", "1")]);
+
+        let changes = plan_sysctl(&backend, &desired).expect("plan");
+
+        assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn sysctl_changes_count_toward_is_empty() {
+        let plan = Plan {
+            sysctl_changes: vec![SysctlParam {
+                name: "net.ipv4.ip_forward".to_owned(),
+                value: "1".to_owned(),
+            }],
             ..Plan::default()
         };
 

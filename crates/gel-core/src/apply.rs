@@ -3,9 +3,9 @@ use crate::{
         PackageBackend, file::FileBackend, service::ServiceBackend, settings::SettingsBackend,
     },
     error::GelError,
-    journal::{FileBackup, RuntimeBackup, ServiceBackup, SettingBackup},
-    plan::{Plan, plan_files, plan_runtime, plan_services, plan_settings},
-    state::DesiredState,
+    journal::{FileBackup, RuntimeBackup, ServiceBackup, SettingBackup, SysctlBackup},
+    plan::{Plan, plan_files, plan_runtime, plan_services, plan_settings, plan_sysctl},
+    state::{DesiredState, ManagedFile},
 };
 
 /// Options controlling how a desired state is applied
@@ -38,76 +38,24 @@ pub struct Applied {
     pub setting_backups: Vec<SettingBackup>,
     /// Prior active-state of each unit started, so it can be rolled back
     pub runtime_backups: Vec<RuntimeBackup>,
+    /// Prior value of each sysctl parameter changed, so it can be rolled back
+    pub sysctl_backups: Vec<SysctlBackup>,
 }
 
-/// Reconcile a backend toward `desired`, returning what was applied
+/// Reconcile managed files (content, mode, owner, group) toward `desired`
 ///
-/// Installs are always applied. Removals are only executed when `opts.prune`
-/// is set. The returned [`Applied::plan`] is the EFFECTIVE plan: it equals what
-/// was actually executed, so in additive mode (`prune` off) its `native_remove`
-/// and `foreign_remove` are empty. This makes the returned plan safe to journal
-/// for rollback, since inverting it can only undo operations that really
-/// happened. To preview what a prune would remove without executing it, use
-/// [`Plan::compute`] directly.
-///
-/// After packages converge, managed files are reconciled: for each file whose
-/// content, mode, owner, or group differs, the prior content and metadata are read
-/// and recorded as a [`FileBackup`] before the change, so the transaction can be
-/// rolled back to the exact prior bytes and permission/ownership (or the file
-/// deleted if it was created). Content is rewritten only when it differs, and each
-/// of mode/owner/group is set only when declared and differing. The affected files
-/// populate `plan.file_writes` so the effective plan reflects them.
-///
-/// After files, declared services converge: only units named in
-/// `desired.services` are considered (never a full-set prune), and for each unit
-/// that is not already in its declared state its prior enabled-state is read and
-/// recorded as a [`ServiceBackup`] before it is enabled or disabled, so the
-/// transaction can restore it. The toggled units populate `plan.service_enable`
-/// and `plan.service_disable` so the effective plan reflects them.
-///
-/// After enablement, runtime state converges: each declared-start unit
-/// (`desired.services.start`) that is not already active is started, with its prior
-/// active-state recorded as a [`RuntimeBackup`] so rollback can stop a unit the
-/// transaction started. Started units populate `plan.service_start`.
-///
-/// After services, declared settings converge: only settings named in
-/// `desired.settings` are considered, and for each setting whose current value
-/// differs from the desired value its prior value is read and recorded as a
-/// [`SettingBackup`] before it is set, so the transaction can restore it. The
-/// changed settings populate `plan.setting_changes` so the effective plan
-/// reflects them.
+/// Returns the files written (the effective file plan) and a [`FileBackup`] per
+/// file, capturing prior content and metadata before any change so the whole file
+/// reconciliation can be rolled back. Content is written only when it differs; each
+/// of mode/owner/group is set only when declared and differing from the current.
 ///
 /// # Errors
 ///
-/// Returns [`GelError`] if any backend query or mutation fails.
-pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>(
+/// Returns [`GelError`] if any backend read or write fails.
+fn converge_files<B: FileBackend>(
     b: &mut B,
     desired: &DesiredState,
-    opts: ApplyOpts,
-) -> Result<Applied, GelError> {
-    let current = b.query_explicit()?;
-    let mut plan = Plan::compute(&current, desired);
-    if !plan.native_install.is_empty() {
-        b.install_native(&plan.native_install)?;
-    }
-    if !plan.foreign_install.is_empty() {
-        b.install_foreign(&plan.foreign_install)?;
-    }
-    if opts.prune {
-        if !plan.native_remove.is_empty() {
-            b.remove_native(&plan.native_remove)?;
-        }
-        if !plan.foreign_remove.is_empty() {
-            b.remove_foreign(&plan.foreign_remove)?;
-        }
-    } else {
-        // additive mode executes no removals, so the effective plan carries none
-        plan.native_remove.clear();
-        plan.foreign_remove.clear();
-    }
-
-    // converge managed files after packages, capturing prior content and mode per
-    // change so both the write and any mode correction can be rolled back
+) -> Result<(Vec<ManagedFile>, Vec<FileBackup>), GelError> {
     let writes = plan_files(b, desired)?;
     let mut file_backups = Vec::with_capacity(writes.len());
     for file in &writes {
@@ -147,6 +95,88 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
             prior_group,
         });
     }
+    Ok((writes, file_backups))
+}
+
+/// Reconcile a backend toward `desired`, returning what was applied
+///
+/// Installs are always applied. Removals are only executed when `opts.prune`
+/// is set. The returned [`Applied::plan`] is the EFFECTIVE plan: it equals what
+/// was actually executed, so in additive mode (`prune` off) its `native_remove`
+/// and `foreign_remove` are empty. This makes the returned plan safe to journal
+/// for rollback, since inverting it can only undo operations that really
+/// happened. To preview what a prune would remove without executing it, use
+/// [`Plan::compute`] directly.
+///
+/// After packages converge, managed files are reconciled: for each file whose
+/// content, mode, owner, or group differs, the prior content and metadata are read
+/// and recorded as a [`FileBackup`] before the change, so the transaction can be
+/// rolled back to the exact prior bytes and permission/ownership (or the file
+/// deleted if it was created). Content is rewritten only when it differs, and each
+/// of mode/owner/group is set only when declared and differing. The affected files
+/// populate `plan.file_writes` so the effective plan reflects them.
+///
+/// After files, declared services converge: only units named in
+/// `desired.services` are considered (never a full-set prune), and for each unit
+/// that is not already in its declared state its prior enabled-state is read and
+/// recorded as a [`ServiceBackup`] before it is enabled or disabled, so the
+/// transaction can restore it. The toggled units populate `plan.service_enable`
+/// and `plan.service_disable` so the effective plan reflects them.
+///
+/// After enablement, runtime state converges: each declared-start unit
+/// (`desired.services.start`) that is not already active is started, with its prior
+/// active-state recorded as a [`RuntimeBackup`] so rollback can stop a unit the
+/// transaction started. Started units populate `plan.service_start`.
+///
+/// After services, declared settings converge: only settings named in
+/// `desired.settings` are considered, and for each setting whose current value
+/// differs from the desired value its prior value is read and recorded as a
+/// [`SettingBackup`] before it is set, so the transaction can restore it. The
+/// changed settings populate `plan.setting_changes` so the effective plan
+/// reflects them.
+///
+/// Finally, declared sysctl parameters converge the same way: each param whose
+/// current value differs is set, its prior value recorded as a [`SysctlBackup`],
+/// and the changes populate `plan.sysctl_changes`.
+///
+/// # Errors
+///
+/// Returns [`GelError`] if any backend query or mutation fails.
+pub fn apply<
+    B: PackageBackend
+        + FileBackend
+        + ServiceBackend
+        + SettingsBackend
+        + crate::backend::sysctl::SysctlBackend,
+>(
+    b: &mut B,
+    desired: &DesiredState,
+    opts: ApplyOpts,
+) -> Result<Applied, GelError> {
+    let current = b.query_explicit()?;
+    let mut plan = Plan::compute(&current, desired);
+    if !plan.native_install.is_empty() {
+        b.install_native(&plan.native_install)?;
+    }
+    if !plan.foreign_install.is_empty() {
+        b.install_foreign(&plan.foreign_install)?;
+    }
+    if opts.prune {
+        if !plan.native_remove.is_empty() {
+            b.remove_native(&plan.native_remove)?;
+        }
+        if !plan.foreign_remove.is_empty() {
+            b.remove_foreign(&plan.foreign_remove)?;
+        }
+    } else {
+        // additive mode executes no removals, so the effective plan carries none
+        plan.native_remove.clear();
+        plan.foreign_remove.clear();
+    }
+
+    // converge managed files after packages (content, mode, owner, group), with a
+    // FileBackup per change so the whole file reconciliation can be rolled back
+    let (writes, file_backups) = converge_files(b, desired)?;
     plan.file_writes = writes;
 
     // converge declared services after files, capturing prior state per toggle.
@@ -195,12 +225,27 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
     let setting_changes = plan_settings(b, desired)?;
     let mut setting_backups = Vec::with_capacity(setting_changes.len());
     for (key, value) in &setting_changes {
-        // read the prior value BEFORE setting so rollback can restore it
-        let prior = b.get(*key)?;
-        b.set(*key, value)?;
+        // read the prior value BEFORE setting so rollback can restore it.
+        // fully-qualified because SysctlBackend also has get/set in scope
+        let prior = SettingsBackend::get(b, *key)?;
+        SettingsBackend::set(b, *key, value)?;
         setting_backups.push(SettingBackup { key: *key, prior });
     }
     plan.setting_changes = setting_changes;
+
+    // converge declared sysctl params after settings, capturing prior value per
+    // change so rollback can restore it; a param already at its value is skipped
+    let sysctl_changes = plan_sysctl(b, desired)?;
+    let mut sysctl_backups = Vec::with_capacity(sysctl_changes.len());
+    for param in &sysctl_changes {
+        let prior = crate::backend::sysctl::SysctlBackend::get(b, &param.name)?;
+        crate::backend::sysctl::SysctlBackend::set(b, &param.name, &param.value)?;
+        sysctl_backups.push(SysctlBackup {
+            name: param.name.clone(),
+            prior,
+        });
+    }
+    plan.sysctl_changes = sysctl_changes;
 
     Ok(Applied {
         plan,
@@ -208,6 +253,7 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
         service_backups,
         setting_backups,
         runtime_backups,
+        sysctl_backups,
     })
 }
 
@@ -219,8 +265,10 @@ mod tests {
             PackageBackend, fake::Call, fake::FakeBackend, file::FileBackend,
             service::ServiceBackend, settings::SettingsBackend,
         },
-        journal::{FileBackup, RuntimeBackup, ServiceBackup, SettingBackup},
-        state::{DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent},
+        journal::{FileBackup, RuntimeBackup, ServiceBackup, SettingBackup, SysctlBackup},
+        state::{
+            DesiredState, ManagedFile, ServiceIntent, SettingKey, SettingsIntent, SysctlParam,
+        },
     };
 
     fn desired_files(files: Vec<ManagedFile>) -> DesiredState {
@@ -230,6 +278,7 @@ mod tests {
             files,
             services: ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         }
     }
 
@@ -504,6 +553,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -542,6 +592,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -572,6 +623,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -587,6 +639,7 @@ mod tests {
             service_backups: applied.service_backups,
             setting_backups: applied.setting_backups,
             runtime_backups: applied.runtime_backups,
+            sysctl_backups: applied.sysctl_backups,
         };
         write_entry(dir.path(), &entry).expect("write");
 
@@ -594,6 +647,77 @@ mod tests {
 
         // the unit the transaction started is stopped again
         assert!(!backend.is_active("nfs-server.service").expect("query"));
+    }
+
+    #[test]
+    fn apply_sets_declared_sysctl_and_backs_up_prior() {
+        let mut backend = FakeBackend::with_sysctl(&[("net.ipv4.ip_forward", "0")]);
+        let desired = DesiredState {
+            sysctl: vec![SysctlParam {
+                name: "net.ipv4.ip_forward".to_owned(),
+                value: "1".to_owned(),
+            }],
+            ..Default::default()
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        // fully-qualified get because SettingsBackend's get is also in scope
+        assert_eq!(
+            crate::backend::sysctl::SysctlBackend::get(&backend, "net.ipv4.ip_forward")
+                .expect("get"),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            applied.sysctl_backups,
+            vec![SysctlBackup {
+                name: "net.ipv4.ip_forward".to_owned(),
+                prior: Some("0".to_owned()),
+            }]
+        );
+        assert!(backend.calls().contains(&Call::SetSysctl(
+            "net.ipv4.ip_forward".to_owned(),
+            "1".to_owned()
+        )));
+    }
+
+    #[test]
+    fn apply_then_rollback_restores_prior_sysctl() {
+        use crate::journal::{JournalEntry, rollback_last, write_entry};
+
+        let mut backend = FakeBackend::with_sysctl(&[("net.ipv4.ip_forward", "0")]);
+        let desired = DesiredState {
+            sysctl: vec![SysctlParam {
+                name: "net.ipv4.ip_forward".to_owned(),
+                value: "1".to_owned(),
+            }],
+            ..Default::default()
+        };
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: applied.plan,
+            snapshot: None,
+            file_backups: applied.file_backups,
+            service_backups: applied.service_backups,
+            setting_backups: applied.setting_backups,
+            runtime_backups: applied.runtime_backups,
+            sysctl_backups: applied.sysctl_backups,
+        };
+        write_entry(dir.path(), &entry).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        // the parameter is restored to its recorded prior value
+        assert_eq!(
+            crate::backend::sysctl::SysctlBackend::get(&backend, "net.ipv4.ip_forward")
+                .expect("get"),
+            Some("0".to_owned())
+        );
     }
 
     #[test]
@@ -609,6 +733,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -648,6 +773,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -690,6 +816,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -716,6 +843,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: ServiceIntent::default(),
+            sysctl: Vec::new(),
             settings: SettingsIntent {
                 hostname: Some("gelbox".to_owned()),
                 ..SettingsIntent::default()
@@ -759,6 +887,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: ServiceIntent::default(),
+            sysctl: Vec::new(),
             settings: SettingsIntent {
                 timezone: Some("UTC".to_owned()),
                 ..SettingsIntent::default()
@@ -790,6 +919,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: ServiceIntent::default(),
+            sysctl: Vec::new(),
             settings: SettingsIntent {
                 hostname: Some("gelbox".to_owned()),
                 ..SettingsIntent::default()
@@ -820,6 +950,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: ServiceIntent::default(),
+            sysctl: Vec::new(),
             settings: SettingsIntent {
                 timezone: Some("UTC".to_owned()),
                 ..SettingsIntent::default()
@@ -886,6 +1017,7 @@ mod tests {
                 disable: vec!["bluetooth.service".to_owned()],
                 ..Default::default()
             },
+            sysctl: Vec::new(),
             settings: SettingsIntent {
                 hostname: Some("gelbox".to_owned()),
                 ..SettingsIntent::default()
@@ -978,6 +1110,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -1008,6 +1141,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");
@@ -1034,6 +1168,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
 
@@ -1076,6 +1211,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let result = apply(&mut backend, &desired, ApplyOpts { prune: false });
@@ -1105,6 +1241,7 @@ mod tests {
             files: vec![],
             services: crate::state::ServiceIntent::default(),
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         apply(&mut backend, &desired, ApplyOpts { prune: true }).expect("apply");

@@ -39,6 +39,8 @@ pub enum Call {
     StopService(String),
     /// `set` was called for this setting with this value
     SetSetting(SettingKey, String),
+    /// `set` (sysctl) was called for this parameter with this value
+    SetSysctl(String, String),
 }
 
 /// An in-memory backend for tests, implementing all four backend traits
@@ -60,6 +62,7 @@ pub struct FakeBackend {
     services: HashMap<String, bool>,
     active: HashMap<String, bool>,
     settings: HashMap<SettingKey, String>,
+    sysctls: HashMap<String, String>,
     calls: Vec<Call>,
     fail_on: Option<Call>,
 }
@@ -112,6 +115,18 @@ impl FakeBackend {
             settings: settings
                 .iter()
                 .map(|(key, value)| (*key, (*value).to_owned()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Construct a backend seeded with the given sysctl `(name, value)` pairs
+    #[must_use]
+    pub fn with_sysctl(params: &[(&str, &str)]) -> Self {
+        Self {
+            sysctls: params
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
             ..Self::default()
         }
@@ -192,6 +207,7 @@ impl PackageBackend for FakeBackend {
             files: Vec::new(),
             services: crate::state::ServiceIntent::default(),
             settings: crate::state::SettingsIntent::default(),
+            sysctl: Vec::new(),
         })
     }
 
@@ -407,6 +423,23 @@ impl SettingsBackend for FakeBackend {
             return Err(GelError::Backend("injected set failure".to_owned()));
         }
         self.settings.insert(key, value.to_owned());
+        self.calls.push(call);
+        Ok(())
+    }
+}
+
+impl crate::backend::sysctl::SysctlBackend for FakeBackend {
+    fn get(&self, name: &str) -> Result<Option<String>, GelError> {
+        Ok(self.sysctls.get(name).cloned())
+    }
+
+    fn set(&mut self, name: &str, value: &str) -> Result<(), GelError> {
+        let call = Call::SetSysctl(name.to_owned(), value.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected sysctl set failure".to_owned()));
+        }
+        self.sysctls.insert(name.to_owned(), value.to_owned());
         self.calls.push(call);
         Ok(())
     }
@@ -856,6 +889,61 @@ mod tests {
         assert_eq!(
             backend.get(SettingKey::Hostname).expect("get"),
             Some("gelbox".to_owned())
+        );
+    }
+
+    #[test]
+    fn set_sysctl_stores_value_and_records_call() {
+        // fully-qualified because SettingsBackend's set/get are also in scope
+        use crate::backend::sysctl::SysctlBackend;
+
+        let mut backend = FakeBackend::default();
+
+        SysctlBackend::set(&mut backend, "net.ipv4.ip_forward", "1").expect("set");
+
+        assert_eq!(
+            SysctlBackend::get(&backend, "net.ipv4.ip_forward").expect("get"),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            backend.calls(),
+            &[Call::SetSysctl(
+                "net.ipv4.ip_forward".to_owned(),
+                "1".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn get_sysctl_is_none_until_set() {
+        use crate::backend::sysctl::SysctlBackend;
+
+        let backend = FakeBackend::default();
+
+        assert_eq!(
+            SysctlBackend::get(&backend, "net.ipv4.ip_forward").expect("get"),
+            None
+        );
+    }
+
+    #[test]
+    fn injected_sysctl_set_failure_is_one_shot() {
+        use crate::backend::sysctl::SysctlBackend;
+
+        let mut backend = FakeBackend::default();
+        backend.set_fail_on(Call::SetSysctl(String::new(), String::new()));
+
+        let first = SysctlBackend::set(&mut backend, "net.ipv4.ip_forward", "1");
+        assert!(first.is_err());
+        assert_eq!(
+            SysctlBackend::get(&backend, "net.ipv4.ip_forward").expect("get"),
+            None
+        );
+
+        SysctlBackend::set(&mut backend, "net.ipv4.ip_forward", "1").expect("set");
+        assert_eq!(
+            SysctlBackend::get(&backend, "net.ipv4.ip_forward").expect("get"),
+            Some("1".to_owned())
         );
     }
 

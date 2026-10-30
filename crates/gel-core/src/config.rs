@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent};
+use crate::state::{DesiredState, ManagedFile, ServiceIntent, SettingsIntent, SysctlParam};
 
 /// Accumulates the native and foreign packages a machine should have
 ///
@@ -25,6 +25,7 @@ pub struct System {
     disable: Vec<String>,
     start: Vec<String>,
     settings: SettingsIntent,
+    sysctl: Vec<SysctlParam>,
 }
 
 impl System {
@@ -152,6 +153,19 @@ impl System {
         self
     }
 
+    /// Declare that kernel parameter `name` should be set to `value` (sysctl)
+    ///
+    /// Chainable and order-independent. Declaring the same name more than once is
+    /// last-wins: the final value is the one lowered into the state.
+    #[must_use]
+    pub fn sysctl(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.sysctl.push(SysctlParam {
+            name: name.into(),
+            value: value.into(),
+        });
+        self
+    }
+
     /// Declare the desired hostname
     ///
     /// Chainable and last-call-wins: the final call sets the managed hostname.
@@ -212,6 +226,7 @@ impl System {
             files: sorted_unique_files(self.files),
             services: build_services(self.enable, self.disable, self.start),
             settings: self.settings,
+            sysctl: sorted_unique_sysctl(self.sysctl),
         }
     }
 }
@@ -259,6 +274,18 @@ fn sorted_unique_files(files: Vec<ManagedFile>) -> Vec<ManagedFile> {
     by_path.into_values().collect()
 }
 
+/// Sort sysctl params by name and deduplicate by name, keeping the last value
+///
+/// A [`BTreeMap`] keyed by name yields last-wins and name-ordered iteration, so
+/// authoring order and repeats do not affect the result.
+fn sorted_unique_sysctl(params: Vec<SysctlParam>) -> Vec<SysctlParam> {
+    let mut by_name: BTreeMap<String, SysctlParam> = BTreeMap::new();
+    for param in params {
+        by_name.insert(param.name.clone(), param);
+    }
+    by_name.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +305,7 @@ mod tests {
                 files: vec![],
                 services: crate::state::ServiceIntent::default(),
                 settings: crate::state::SettingsIntent::default(),
+                sysctl: Vec::new(),
             }
         );
     }

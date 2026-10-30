@@ -189,10 +189,24 @@ restores that prior value; a setting that had no prior value (it was previously
 unset) is left as-is rather than cleared, so rollback never invents an empty
 hostname, timezone, or locale.
 
-Not yet handled (planned for later phases): users and groups, `sysctl` kernel
-parameters, kernel modules, the console keymap and font, and locale categories
-beyond `LANG` (for example `LC_TIME` or `LC_MESSAGES`). gel manages only the
-hostname, timezone, and single `LANG` locale you declare.
+Not yet handled (planned for later phases): users and groups, kernel modules, the
+console keymap and font, and locale categories beyond `LANG` (for example
+`LC_TIME` or `LC_MESSAGES`). gel manages only the hostname, timezone, and single
+`LANG` locale you declare.
+
+### Managed kernel parameters (sysctl)
+
+`System::sysctl(name, value)` declares a kernel parameter such as
+`net.ipv4.ip_forward = 1`. On `apply`, gel sets each declared parameter whose
+running value differs (via `sysctl -w`) and records the prior value, so `rollback`
+restores it; a parameter already at its value is skipped. This sets the running
+value. To persist a parameter across reboots, pair it with a managed file under
+`/etc/sysctl.d/` (gel manages files), for example
+`.file("/etc/sysctl.d/99-gel.conf", "net.ipv4.ip_forward=1\n")`.
+
+Not yet handled (planned for later phases): automatically reloading
+`/etc/sysctl.d` after a file change, and removing a parameter just because it left
+the config. gel sets the running value of each parameter you declare.
 
 ### 2. Evaluate (pure, always available)
 

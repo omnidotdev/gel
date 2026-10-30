@@ -163,6 +163,7 @@ impl<R: CommandRunner> PackageBackend for ArchBackend<R> {
             files: Vec::new(),
             services: crate::state::ServiceIntent::default(),
             settings: crate::state::SettingsIntent::default(),
+            sysctl: Vec::new(),
         })
     }
 
@@ -396,6 +397,27 @@ impl<R: CommandRunner> SettingsBackend for ArchBackend<R> {
                 self.run_checked("localectl", &["set-locale", &lang], "locale change")
             }
         }
+    }
+}
+
+impl<R: CommandRunner> crate::backend::sysctl::SysctlBackend for ArchBackend<R> {
+    fn get(&self, name: &str) -> Result<Option<String>, GelError> {
+        let output = self.runner.run("sysctl", &["-n", name])?;
+        // sysctl -n exits non-zero for an unknown key; report it as unset rather
+        // than an error so a convergence can still set it. stderr is for
+        // server-side logs only, never surfaced to users
+        if !output.success {
+            return Ok(None);
+        }
+        let value = output.stdout.trim();
+        Ok((!value.is_empty()).then(|| value.to_owned()))
+    }
+
+    fn set(&mut self, name: &str, value: &str) -> Result<(), GelError> {
+        // sysctl -w takes a name=value assignment; this sets the running value.
+        // Persisting across reboot is done by managing an /etc/sysctl.d file
+        let assignment = format!("{name}={value}");
+        self.run_checked("sysctl", &["-w", &assignment], "sysctl change")
     }
 }
 
@@ -753,6 +775,49 @@ mod tests {
                 "systemctl".to_owned(),
                 owned(&["stop", "nfs-server.service"])
             )]
+        );
+    }
+
+    #[test]
+    fn get_sysctl_reads_value_and_builds_argv() {
+        use crate::backend::sysctl::SysctlBackend;
+
+        let runner = MockRunner::new(true, "1\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        // fully-qualified because SettingsBackend's get is also in scope
+        assert_eq!(
+            SysctlBackend::get(&backend, "net.ipv4.ip_forward").expect("get"),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![("sysctl".to_owned(), owned(&["-n", "net.ipv4.ip_forward"]))]
+        );
+    }
+
+    #[test]
+    fn get_sysctl_reports_none_on_nonzero_exit() {
+        use crate::backend::sysctl::SysctlBackend;
+
+        let runner = MockRunner::new(false, "", "unknown key", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        assert_eq!(SysctlBackend::get(&backend, "bad.key").expect("get"), None);
+    }
+
+    #[test]
+    fn set_sysctl_builds_sysctl_w_argv() {
+        use crate::backend::sysctl::SysctlBackend;
+
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        SysctlBackend::set(&mut backend, "net.ipv4.ip_forward", "1").expect("set");
+
+        assert_eq!(
+            runner.calls(),
+            vec![("sysctl".to_owned(), owned(&["-w", "net.ipv4.ip_forward=1"]))]
         );
     }
 

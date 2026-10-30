@@ -33,6 +33,19 @@ pub struct ManagedFile {
     pub group: Option<String>,
 }
 
+/// A kernel parameter (sysctl) managed declaratively
+///
+/// Name/value pairs such as `net.ipv4.ip_forward = 1`. gel sets the running value
+/// (and records the prior one so it can be rolled back); to persist a parameter
+/// across reboots, pair it with a managed file under `/etc/sysctl.d/`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SysctlParam {
+    /// The parameter name, e.g. `net.ipv4.ip_forward`
+    pub name: String,
+    /// The desired value, e.g. `1`
+    pub value: String,
+}
+
 /// Explicit intent over systemd units, expressed as two disjoint lists
 ///
 /// This is deliberately NOT full-set convergence: only the units named here are
@@ -108,7 +121,7 @@ impl SettingsIntent {
 }
 
 /// Explicit packages and managed files a machine should have
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredState {
     /// Explicitly installed native (official-repo) packages
     pub native: Vec<String>,
@@ -129,6 +142,11 @@ pub struct DesiredState {
     /// Defaulted so artifacts predating the settings model still deserialize
     #[serde(default)]
     pub settings: SettingsIntent,
+    /// Declarative kernel parameters (sysctl)
+    ///
+    /// Defaulted so artifacts predating sysctl management still deserialize
+    #[serde(default)]
+    pub sysctl: Vec<SysctlParam>,
 }
 
 /// Actual explicit packages currently on the machine
@@ -154,6 +172,7 @@ mod tests {
                 ..Default::default()
             },
             settings: SettingsIntent::default(),
+            sysctl: Vec::new(),
         };
 
         let json = serde_json::to_string(&state).expect("serialize");
@@ -279,6 +298,7 @@ mod tests {
             foreign: vec![],
             files: vec![],
             services: ServiceIntent::default(),
+            sysctl: Vec::new(),
             settings: SettingsIntent {
                 hostname: Some("gelbox".to_owned()),
                 timezone: Some("UTC".to_owned()),

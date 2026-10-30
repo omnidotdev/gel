@@ -87,6 +87,19 @@ pub struct SettingBackup {
     pub prior: Option<String>,
 }
 
+/// The value of a kernel parameter (sysctl) before an apply changed it
+///
+/// Mirrors [`SettingBackup`]: `prior` is `Some(old)` when the parameter had a
+/// readable value before the apply, and `None` when it was unset or unreadable. A
+/// `None` prior is left as-is on rollback rather than trying to unset the param.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SysctlBackup {
+    /// The parameter name
+    pub name: String,
+    /// The parameter's value before the apply, or `None` if it was unset
+    pub prior: Option<String>,
+}
+
 /// The active-state of a systemd unit before an apply started it
 ///
 /// Recorded per unit the transaction actually started, mirroring [`ServiceBackup`]
@@ -136,6 +149,12 @@ pub struct JournalEntry {
     /// cleanly as having started no units.
     #[serde(default)]
     pub runtime_backups: Vec<RuntimeBackup>,
+    /// Prior value of every sysctl parameter this transaction changed
+    ///
+    /// Defaulted so journal entries predating sysctl management still deserialize
+    /// cleanly as having changed no parameters.
+    #[serde(default)]
+    pub sysctl_backups: Vec<SysctlBackup>,
 }
 
 /// Write `entry` as JSON to `dir`, named by its id, creating `dir` if needed
@@ -189,7 +208,8 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// a unit it enabled. Each runtime backup is undone by stopping a unit the apply
 /// started (or starting one it stopped). Each setting backup with a `Some` prior is set back to that
 /// value; a `None` prior is left as-is, because a scalar system setting cannot be
-/// meaningfully unset. A missing or empty journal is a no-op.
+/// meaningfully unset. Each sysctl backup is restored the same way (a `None` prior
+/// left as-is). A missing or empty journal is a no-op.
 ///
 /// # Errors
 ///
@@ -197,7 +217,11 @@ pub fn read_latest(dir: &Path) -> Result<Option<JournalEntry>, GelError> {
 /// fails.
 pub fn rollback_last<B>(dir: &Path, b: &mut B) -> Result<(), GelError>
 where
-    B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend,
+    B: PackageBackend
+        + FileBackend
+        + ServiceBackend
+        + SettingsBackend
+        + crate::backend::sysctl::SysctlBackend,
 {
     let Some(entry) = read_latest(dir)? else {
         return Ok(());
@@ -263,7 +287,14 @@ where
     // restore to, so skip it rather than erroring
     for backup in &entry.setting_backups {
         if let Some(old) = &backup.prior {
-            b.set(backup.key, old)?;
+            SettingsBackend::set(b, backup.key, old)?;
+        }
+    }
+    // restore sysctl after settings: a param with a prior value is set back; a
+    // None prior is left as-is, since a kernel param has no meaningful unset state
+    for backup in &entry.sysctl_backups {
+        if let Some(old) = &backup.prior {
+            crate::backend::sysctl::SysctlBackend::set(b, &backup.name, old)?;
         }
     }
     Ok(())

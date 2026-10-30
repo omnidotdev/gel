@@ -16,7 +16,7 @@ use gel_core::{
     apply::{ApplyOpts, apply},
     backend::{PackageBackend, arch::ArchBackend},
     journal::{self, JournalEntry},
-    plan::{Plan, plan_files, plan_runtime, plan_services, plan_settings},
+    plan::{Plan, plan_files, plan_runtime, plan_services, plan_settings, plan_sysctl},
     snapshot::{SnapshotId, SnapshotProvider},
     snapshot_btrfs::BtrfsSnapshot,
     state::DesiredState,
@@ -73,6 +73,9 @@ pub fn diff(artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // surface units to start; this queries active state but changes nothing
     plan.service_start =
         plan_runtime(&backend, &desired).context("failed to plan service starts")?;
+    // surface sysctl changes; this reads current values but changes nothing
+    plan.sysctl_changes =
+        plan_sysctl(&backend, &desired).context("failed to plan sysctl changes")?;
     render::print_plan(&plan);
     Ok(())
 }
@@ -155,6 +158,9 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
     // as "nothing to apply"
     preview.service_start =
         plan_runtime(&backend, &desired).context("failed to plan service starts")?;
+    // include pending sysctl changes so a sysctl-only change is not "nothing to apply"
+    preview.sysctl_changes =
+        plan_sysctl(&backend, &desired).context("failed to plan sysctl changes")?;
     render::print_plan(&preview);
     if preview.is_empty() {
         println!("system already matches the desired state; nothing to apply");
@@ -176,6 +182,7 @@ pub fn apply_cmd(prune: bool, artifact: Option<PathBuf>) -> anyhow::Result<()> {
         service_backups: applied.service_backups,
         setting_backups: applied.setting_backups,
         runtime_backups: applied.runtime_backups,
+        sysctl_backups: applied.sysctl_backups,
     };
     journal::write_entry(&paths::journal_dir()?, &entry)
         .context("failed to record the transaction journal entry")?;

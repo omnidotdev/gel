@@ -7,8 +7,9 @@ use gel_core::plan::Plan;
 /// When the plan carries managed file writes, they are summarized as
 /// `~N files to write` and each target path is listed. Service intent is
 /// summarized as `+N to enable, -N to disable, ~N to start` on a second line with each unit
-/// listed, and setting changes as `~N settings to change` on a third line with
-/// each key/value listed. A plan produced by [`Plan::compute`] alone carries no
+/// listed, setting changes as `~N settings to change`, and sysctl changes as
+/// `~N sysctl to change`, each with its key/value listed. A plan produced by
+/// [`Plan::compute`] alone carries no
 /// file writes, service actions, or setting changes (those require reading
 /// current state); callers that want them surfaced populate `file_writes` via
 /// [`gel_core::plan::plan_files`], `service_enable`/`service_disable` via
@@ -53,5 +54,11 @@ pub fn print_plan(plan: &Plan) {
     println!("~{settings} settings to change");
     for (key, value) in &plan.setting_changes {
         println!("  ~ {key:?} = {value} (setting)");
+    }
+
+    let sysctls = plan.sysctl_changes.len();
+    println!("~{sysctls} sysctl to change");
+    for param in &plan.sysctl_changes {
+        println!("  ~ {} = {} (sysctl)", param.name, param.value);
     }
 }
