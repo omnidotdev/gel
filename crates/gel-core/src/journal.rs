@@ -28,7 +28,7 @@ use crate::{
 /// delete a file the transaction created. `prior` is `None` when the file did
 /// not exist before the apply (the transaction created it), and `Some(old)`
 /// when the apply replaced pre-existing content.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileBackup {
     /// Absolute path of the managed file that was written
     pub path: String,
@@ -42,6 +42,17 @@ pub struct FileBackup {
     /// rollback leaves the file's mode as-is rather than inventing one.
     #[serde(default)]
     pub prior_mode: Option<u32>,
+    /// The file's owning user before the apply, or `None` when the file did not
+    /// exist or its owner was not managed
+    ///
+    /// Defaulted for the same back-compat reason as `prior_mode`; a `None` here on
+    /// rollback leaves the owner as-is.
+    #[serde(default)]
+    pub prior_owner: Option<String>,
+    /// The file's owning group before the apply, or `None` when the file did not
+    /// exist or its group was not managed
+    #[serde(default)]
+    pub prior_group: Option<String>,
 }
 
 /// The enabled-state of a systemd unit before an apply changed it
@@ -190,12 +201,18 @@ where
         match &backup.prior {
             Some(old) => {
                 b.write_file(&backup.path, old)?;
-                // restore the prior mode after rewriting the content, but only when
-                // a prior mode was captured. A None prior_mode means the mode was
-                // unmanaged (or the file was created by this transaction), so the
-                // mode is left as-is rather than inventing one
+                // restore the prior mode/owner/group after rewriting the content,
+                // but only for facets a prior was captured for. A None means that
+                // facet was unmanaged (or the file was created by this transaction),
+                // so it is left as-is rather than invented
                 if let Some(mode) = backup.prior_mode {
                     b.set_mode(&backup.path, mode)?;
+                }
+                if let Some(owner) = &backup.prior_owner {
+                    b.set_owner(&backup.path, owner)?;
+                }
+                if let Some(group) = &backup.prior_group {
+                    b.set_group(&backup.path, group)?;
                 }
             }
             None => b.remove_file(&backup.path)?,
@@ -414,11 +431,13 @@ mod tests {
                     path: "/etc/changed".to_owned(),
                     prior: Some("old\n".to_owned()),
                     prior_mode: None,
+                    ..Default::default()
                 },
                 FileBackup {
                     path: "/etc/new".to_owned(),
                     prior: None,
                     prior_mode: None,
+                    ..Default::default()
                 },
             ],
             service_backups: Vec::new(),
@@ -461,6 +480,7 @@ mod tests {
                 path: "/etc/exports".to_owned(),
                 prior: Some("x\n".to_owned()),
                 prior_mode: Some(0o600),
+                ..Default::default()
             }],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
@@ -495,6 +515,7 @@ mod tests {
                 path: "/etc/motd".to_owned(),
                 prior: Some("hi\n".to_owned()),
                 prior_mode: None,
+                ..Default::default()
             }],
             service_backups: Vec::new(),
             setting_backups: Vec::new(),
@@ -511,6 +532,91 @@ mod tests {
                 .any(|c| matches!(c, Call::SetFileMode(_)))
         );
         assert_eq!(backend.mode("/etc/motd").expect("mode"), Some(0o644));
+    }
+
+    #[test]
+    fn rollback_last_restores_prior_owner_and_group() {
+        // the recorded transaction changed owner to root and group to nfs, so the
+        // post-apply backend holds those; rollback restores the prior nobody/nogroup
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_owner("/etc/exports", "root");
+        backend.set_file_group("/etc/exports", "nfs");
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: vec![FileBackup {
+                path: "/etc/exports".to_owned(),
+                prior: Some("x\n".to_owned()),
+                prior_mode: None,
+                prior_owner: Some("nobody".to_owned()),
+                prior_group: Some("nogroup".to_owned()),
+            }],
+            service_backups: Vec::new(),
+            setting_backups: Vec::new(),
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        assert_eq!(
+            backend.owner("/etc/exports").expect("owner"),
+            Some("nobody".to_owned())
+        );
+        assert_eq!(
+            backend.group("/etc/exports").expect("group"),
+            Some("nogroup".to_owned())
+        );
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetFileOwner("/etc/exports".to_owned()))
+        );
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetFileGroup("/etc/exports".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rollback_last_leaves_ownership_untouched_when_prior_is_none() {
+        // a backup whose prior owner/group are None (ownership was unmanaged, or the
+        // file was created) must not issue a chown on rollback
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FakeBackend::with_files(&[("/etc/motd", "hi\n")]);
+        backend.set_file_owner("/etc/motd", "root");
+        let recorded = JournalEntry {
+            id: "tx-1".to_owned(),
+            timestamp: "2026-07-19T00:00:00Z".to_owned(),
+            plan: Plan::default(),
+            snapshot: None,
+            file_backups: vec![FileBackup {
+                path: "/etc/motd".to_owned(),
+                prior: Some("hi\n".to_owned()),
+                prior_mode: None,
+                prior_owner: None,
+                prior_group: None,
+            }],
+            service_backups: Vec::new(),
+            setting_backups: Vec::new(),
+        };
+        write_entry(dir.path(), &recorded).expect("write");
+
+        rollback_last(dir.path(), &mut backend).expect("rollback");
+
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::SetFileOwner(_) | Call::SetFileGroup(_)))
+        );
+        assert_eq!(
+            backend.owner("/etc/motd").expect("owner"),
+            Some("root".to_owned())
+        );
     }
 
     #[test]

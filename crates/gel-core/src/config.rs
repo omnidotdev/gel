@@ -87,7 +87,35 @@ impl System {
             path: path.into(),
             content: content.into(),
             mode: Some(mode),
+            ..Default::default()
         });
+        self
+    }
+
+    /// Set the owning user of the most recently declared file
+    ///
+    /// Applies to the file added by the preceding [`System::file`] or
+    /// [`System::file_mode`], so it reads naturally as
+    /// `.file(path, content).owner("root")`. A no-op if no file has been declared
+    /// yet, so a stray call can never panic.
+    #[must_use]
+    pub fn owner(mut self, owner: impl Into<String>) -> Self {
+        if let Some(file) = self.files.last_mut() {
+            file.owner = Some(owner.into());
+        }
+        self
+    }
+
+    /// Set the owning group of the most recently declared file
+    ///
+    /// Applies to the file added by the preceding [`System::file`] or
+    /// [`System::file_mode`], mirroring [`System::owner`]. A no-op if no file has
+    /// been declared yet.
+    #[must_use]
+    pub fn group(mut self, group: impl Into<String>) -> Self {
+        if let Some(file) = self.files.last_mut() {
+            file.group = Some(group.into());
+        }
         self
     }
 
@@ -370,6 +398,7 @@ mod tests {
                 path: "/etc/exports".to_owned(),
                 content: "x\n".to_owned(),
                 mode: Some(0o644),
+                ..Default::default()
             }]
         );
     }
@@ -397,8 +426,57 @@ mod tests {
                 path: "/etc/exports".to_owned(),
                 content: "second\n".to_owned(),
                 mode: Some(0o600),
+                ..Default::default()
             }]
         );
+    }
+
+    #[test]
+    fn owner_and_group_set_attributes_on_the_last_file() {
+        let desired = System::new()
+            .file("/etc/exports", "x\n")
+            .owner("root")
+            .group("nfs")
+            .build();
+
+        assert_eq!(
+            desired.files,
+            vec![ManagedFile {
+                path: "/etc/exports".to_owned(),
+                content: "x\n".to_owned(),
+                owner: Some("root".to_owned()),
+                group: Some("nfs".to_owned()),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn owner_and_group_compose_with_file_mode() {
+        let desired = System::new()
+            .file_mode("/etc/exports", "x\n", 0o600)
+            .owner("root")
+            .group("nfs")
+            .build();
+
+        assert_eq!(
+            desired.files,
+            vec![ManagedFile {
+                path: "/etc/exports".to_owned(),
+                content: "x\n".to_owned(),
+                mode: Some(0o600),
+                owner: Some("root".to_owned()),
+                group: Some("nfs".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn owner_with_no_declared_file_is_a_noop() {
+        // calling owner before any file is declared must not panic and adds nothing
+        let desired = System::new().owner("root").build();
+
+        assert!(desired.files.is_empty());
     }
 
     #[test]

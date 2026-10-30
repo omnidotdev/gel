@@ -97,6 +97,20 @@ impl<R: CommandRunner> ArchBackend<R> {
             output.stderr.trim()
         )))
     }
+
+    /// Read a single `stat -c <format>` field for `path`, or `None` when absent
+    ///
+    /// `stat` exits non-zero for a missing file; that is treated as an absent
+    /// value (`None`), mirroring `read_file`, rather than an error. An empty field
+    /// is also reported as `None`. stderr is for server-side logs only.
+    fn stat_field(&self, path: &str, format: &str) -> Result<Option<String>, GelError> {
+        let output = self.runner.run("stat", &["-c", format, path])?;
+        if !output.success {
+            return Ok(None);
+        }
+        let value = output.stdout.trim();
+        Ok((!value.is_empty()).then(|| value.to_owned()))
+    }
 }
 
 /// Parse newline-separated package names, dropping blank lines
@@ -236,6 +250,24 @@ impl<R: CommandRunner> FileBackend for ArchBackend<R> {
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), GelError> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         Ok(())
+    }
+
+    fn owner(&self, path: &str) -> Result<Option<String>, GelError> {
+        // %U is the owning user name; name resolution is left to stat/chown so gel
+        // does not need a passwd-lookup dependency
+        self.stat_field(path, "%U")
+    }
+
+    fn group(&self, path: &str) -> Result<Option<String>, GelError> {
+        self.stat_field(path, "%G")
+    }
+
+    fn set_owner(&mut self, path: &str, owner: &str) -> Result<(), GelError> {
+        self.run_checked("chown", &[owner, path], "file owner change")
+    }
+
+    fn set_group(&mut self, path: &str, group: &str) -> Result<(), GelError> {
+        self.run_checked("chgrp", &[group, path], "file group change")
     }
 }
 
@@ -750,5 +782,72 @@ mod tests {
         let result = backend.set(SettingKey::Hostname, "gelbox");
 
         assert!(matches!(result, Err(GelError::Backend(_))));
+    }
+
+    #[test]
+    fn owner_reads_stat_user_field() {
+        let runner = MockRunner::new(true, "root\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert_eq!(
+            backend.owner("/etc/exports").expect("owner"),
+            Some("root".to_owned())
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![("stat".to_owned(), owned(&["-c", "%U", "/etc/exports"]))]
+        );
+    }
+
+    #[test]
+    fn group_reads_stat_group_field() {
+        let runner = MockRunner::new(true, "nfs\n", "", &[]);
+        let backend = ArchBackend::with_runner(runner.clone());
+
+        assert_eq!(
+            backend.group("/etc/exports").expect("group"),
+            Some("nfs".to_owned())
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![("stat".to_owned(), owned(&["-c", "%G", "/etc/exports"]))]
+        );
+    }
+
+    #[test]
+    fn owner_is_none_when_stat_fails() {
+        // stat exits non-zero for a missing file; the owner is reported as absent
+        let runner = MockRunner::new(false, "", "No such file or directory", &[]);
+        let backend = ArchBackend::with_runner(runner);
+
+        assert_eq!(backend.owner("/missing").expect("owner"), None);
+    }
+
+    #[test]
+    fn set_owner_builds_chown_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend
+            .set_owner("/etc/exports", "root")
+            .expect("set_owner");
+
+        assert_eq!(
+            runner.calls(),
+            vec![("chown".to_owned(), owned(&["root", "/etc/exports"]))]
+        );
+    }
+
+    #[test]
+    fn set_group_builds_chgrp_argv() {
+        let runner = MockRunner::new(true, "", "", &[]);
+        let mut backend = ArchBackend::with_runner(runner.clone());
+
+        backend.set_group("/etc/exports", "nfs").expect("set_group");
+
+        assert_eq!(
+            runner.calls(),
+            vec![("chgrp".to_owned(), owned(&["nfs", "/etc/exports"]))]
+        );
     }
 }

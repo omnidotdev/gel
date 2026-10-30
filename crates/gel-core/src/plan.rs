@@ -70,10 +70,10 @@ impl Plan {
 /// Compute the managed files that need a write to reach `desired`
 ///
 /// A desired file is included when it is absent on the backend, its current
-/// content differs from the desired content, or it declares a mode that differs
-/// from the current one (a mode of `None` is unmanaged and never forces a write).
-/// Unlike [`Plan::compute`], this reads current state through `backend`, so it is
-/// kept out of the pure planner.
+/// content differs, or it declares a mode, owner, or group that differs from the
+/// current one. Any of mode/owner/group left `None` is unmanaged and never forces
+/// a write. Unlike [`Plan::compute`], this reads current state through `backend`,
+/// so it is kept out of the pure planner.
 /// This phase does not remove files, only writes. Results are ordered by path so
 /// the plan is deterministic regardless of authoring order.
 ///
@@ -95,7 +95,18 @@ pub fn plan_files(
             Some(desired_mode) => backend.mode(&file.path)? != Some(desired_mode),
             None => false,
         };
-        if content_differs || mode_differs {
+        // ownership is managed independently: a declared owner or group that
+        // differs from the current one warrants a write, and a None leaves that
+        // facet unmanaged (never forcing a write)
+        let owner_differs = match &file.owner {
+            Some(owner) => backend.owner(&file.path)?.as_deref() != Some(owner.as_str()),
+            None => false,
+        };
+        let group_differs = match &file.group {
+            Some(group) => backend.group(&file.path)?.as_deref() != Some(group.as_str()),
+            None => false,
+        };
+        if content_differs || mode_differs || owner_differs || group_differs {
             writes.push(file.clone());
         }
     }
@@ -291,6 +302,7 @@ mod tests {
             path: "/etc/exports".to_owned(),
             content: "x\n".to_owned(),
             mode: Some(0o644),
+            ..Default::default()
         }]);
 
         let writes = plan_files(&backend, &desired).expect("plan");
@@ -306,6 +318,7 @@ mod tests {
             path: "/etc/exports".to_owned(),
             content: "x\n".to_owned(),
             mode: Some(0o644),
+            ..Default::default()
         }]);
 
         let writes = plan_files(&backend, &desired).expect("plan");
@@ -323,6 +336,57 @@ mod tests {
             path: "/etc/motd".to_owned(),
             content: "hi\n".to_owned(),
             mode: None,
+            ..Default::default()
+        }]);
+
+        let writes = plan_files(&backend, &desired).expect("plan");
+
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn file_with_differing_owner_is_planned() {
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_owner("/etc/exports", "nobody");
+        let desired = desired_with_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            owner: Some("root".to_owned()),
+            ..Default::default()
+        }]);
+
+        let writes = plan_files(&backend, &desired).expect("plan");
+
+        assert_eq!(writes, desired.files);
+    }
+
+    #[test]
+    fn file_with_differing_group_is_planned() {
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_group("/etc/exports", "wheel");
+        let desired = desired_with_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            group: Some("nfs".to_owned()),
+            ..Default::default()
+        }]);
+
+        let writes = plan_files(&backend, &desired).expect("plan");
+
+        assert_eq!(writes, desired.files);
+    }
+
+    #[test]
+    fn file_with_matching_owner_and_group_is_not_planned() {
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_owner("/etc/exports", "root");
+        backend.set_file_group("/etc/exports", "nfs");
+        let desired = desired_with_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            owner: Some("root".to_owned()),
+            group: Some("nfs".to_owned()),
+            ..Default::default()
         }]);
 
         let writes = plan_files(&backend, &desired).expect("plan");

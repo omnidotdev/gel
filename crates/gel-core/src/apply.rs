@@ -48,12 +48,13 @@ pub struct Applied {
 /// happened. To preview what a prune would remove without executing it, use
 /// [`Plan::compute`] directly.
 ///
-/// After packages converge, managed files are written: for each file that is
-/// absent or whose content differs, the prior content is read and recorded as a
-/// [`FileBackup`] before the new content is written, so the transaction can be
-/// rolled back to the exact prior bytes (or the file deleted if it was created).
-/// The written files populate `plan.file_writes` so the effective plan reflects
-/// them.
+/// After packages converge, managed files are reconciled: for each file whose
+/// content, mode, owner, or group differs, the prior content and metadata are read
+/// and recorded as a [`FileBackup`] before the change, so the transaction can be
+/// rolled back to the exact prior bytes and permission/ownership (or the file
+/// deleted if it was created). Content is rewritten only when it differs, and each
+/// of mode/owner/group is set only when declared and differing. The affected files
+/// populate `plan.file_writes` so the effective plan reflects them.
 ///
 /// After files, declared services converge: only units named in
 /// `desired.services` are considered (never a full-set prune), and for each unit
@@ -103,25 +104,40 @@ pub fn apply<B: PackageBackend + FileBackend + ServiceBackend + SettingsBackend>
     let writes = plan_files(b, desired)?;
     let mut file_backups = Vec::with_capacity(writes.len());
     for file in &writes {
-        // read the prior content and mode BEFORE changing them so rollback can
-        // restore the exact prior bytes and permission bits
+        // read the prior content, mode, owner, and group BEFORE changing them so
+        // rollback can restore each to exactly what it was
         let prior = b.read_file(&file.path)?;
         let prior_mode = b.mode(&file.path)?;
-        // write content only when it actually differs, so a mode-only change does
-        // not rewrite identical bytes or emit a spurious write
+        let prior_owner = b.owner(&file.path)?;
+        let prior_group = b.group(&file.path)?;
+        // write content only when it actually differs, so a metadata-only change
+        // does not rewrite identical bytes or emit a spurious write
         if prior.as_deref() != Some(file.content.as_str()) {
             b.write_file(&file.path, &file.content)?;
         }
-        // set the mode only when it is managed (Some) and differs from the current
+        // set each managed facet only when it is declared (Some) and differs from
+        // the current value; a facet left None is unmanaged and never touched
         if let Some(mode) = file.mode {
             if prior_mode != Some(mode) {
                 b.set_mode(&file.path, mode)?;
+            }
+        }
+        if let Some(owner) = &file.owner {
+            if prior_owner.as_deref() != Some(owner.as_str()) {
+                b.set_owner(&file.path, owner)?;
+            }
+        }
+        if let Some(group) = &file.group {
+            if prior_group.as_deref() != Some(group.as_str()) {
+                b.set_group(&file.path, group)?;
             }
         }
         file_backups.push(FileBackup {
             path: file.path.clone(),
             prior,
             prior_mode,
+            prior_owner,
+            prior_group,
         });
     }
     plan.file_writes = writes;
@@ -217,6 +233,7 @@ mod tests {
                 path: "/etc/hostname".to_owned(),
                 prior: None,
                 prior_mode: None,
+                ..Default::default()
             }]
         );
         // the effective plan reflects what was written
@@ -253,6 +270,7 @@ mod tests {
                 path: "/etc/hostname".to_owned(),
                 prior: Some("old\n".to_owned()),
                 prior_mode: None,
+                ..Default::default()
             }]
         );
     }
@@ -290,6 +308,7 @@ mod tests {
             path: "/etc/exports".to_owned(),
             content: "x\n".to_owned(),
             mode: Some(0o644),
+            ..Default::default()
         }]);
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -315,6 +334,7 @@ mod tests {
                 path: "/etc/exports".to_owned(),
                 prior: Some("x\n".to_owned()),
                 prior_mode: Some(0o600),
+                ..Default::default()
             }]
         );
     }
@@ -326,6 +346,7 @@ mod tests {
             path: "/etc/exports".to_owned(),
             content: "x\n".to_owned(),
             mode: Some(0o640),
+            ..Default::default()
         }]);
 
         let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -344,6 +365,7 @@ mod tests {
                 path: "/etc/exports".to_owned(),
                 prior: None,
                 prior_mode: None,
+                ..Default::default()
             }]
         );
     }
@@ -357,6 +379,7 @@ mod tests {
             path: "/etc/motd".to_owned(),
             content: "hi\n".to_owned(),
             mode: None,
+            ..Default::default()
         }]);
 
         apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
@@ -366,6 +389,83 @@ mod tests {
                 .calls()
                 .iter()
                 .any(|c| matches!(c, Call::SetFileMode(_)))
+        );
+    }
+
+    #[test]
+    fn apply_sets_declared_owner_and_group_and_backs_up_prior() {
+        // content and mode match, but owner and group differ, so the apply sets
+        // them and records the prior owner and group, without rewriting content
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        backend.set_file("/etc/exports", "x\n");
+        backend.set_file_owner("/etc/exports", "nobody");
+        backend.set_file_group("/etc/exports", "nogroup");
+        let desired = desired_files(vec![ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            owner: Some("root".to_owned()),
+            group: Some("nfs".to_owned()),
+            ..Default::default()
+        }]);
+
+        let applied = apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        assert_eq!(
+            backend.owner("/etc/exports").expect("owner"),
+            Some("root".to_owned())
+        );
+        assert_eq!(
+            backend.group("/etc/exports").expect("group"),
+            Some("nfs".to_owned())
+        );
+        // set_owner and set_group were issued, and no content write since it matched
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetFileOwner("/etc/exports".to_owned()))
+        );
+        assert!(
+            backend
+                .calls()
+                .contains(&Call::SetFileGroup("/etc/exports".to_owned()))
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::WriteFile(_)))
+        );
+        // the prior owner and group are captured for rollback
+        assert_eq!(
+            applied.file_backups,
+            vec![FileBackup {
+                path: "/etc/exports".to_owned(),
+                prior: Some("x\n".to_owned()),
+                prior_mode: None,
+                prior_owner: Some("nobody".to_owned()),
+                prior_group: Some("nogroup".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_with_unmanaged_ownership_issues_no_chown() {
+        // a file that manages neither owner nor group must never chown, even when
+        // its content changes
+        let mut backend = FakeBackend::with_explicit(&[], &[]);
+        let desired = desired_files(vec![ManagedFile {
+            path: "/etc/motd".to_owned(),
+            content: "hi\n".to_owned(),
+            ..Default::default()
+        }]);
+
+        apply(&mut backend, &desired, ApplyOpts { prune: false }).expect("apply");
+
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::SetFileOwner(_) | Call::SetFileGroup(_)))
         );
     }
 

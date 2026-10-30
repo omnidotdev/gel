@@ -25,6 +25,10 @@ pub enum Call {
     RemoveFile(String),
     /// `set_mode` was called for this path
     SetFileMode(String),
+    /// `set_owner` was called for this path
+    SetFileOwner(String),
+    /// `set_group` was called for this path
+    SetFileGroup(String),
     /// `enable` was called for this unit
     EnableService(String),
     /// `disable` was called for this unit
@@ -47,6 +51,8 @@ pub struct FakeBackend {
     foreign: Vec<String>,
     files: HashMap<String, String>,
     file_modes: HashMap<String, u32>,
+    file_owners: HashMap<String, String>,
+    file_groups: HashMap<String, String>,
     services: HashMap<String, bool>,
     settings: HashMap<SettingKey, String>,
     calls: Vec<Call>,
@@ -105,6 +111,16 @@ impl FakeBackend {
     /// Seed or overwrite a single file's mode without recording a call
     pub fn set_file_mode(&mut self, path: &str, mode: u32) {
         self.file_modes.insert(path.to_owned(), mode);
+    }
+
+    /// Seed or overwrite a single file's owner without recording a call
+    pub fn set_file_owner(&mut self, path: &str, owner: &str) {
+        self.file_owners.insert(path.to_owned(), owner.to_owned());
+    }
+
+    /// Seed or overwrite a single file's group without recording a call
+    pub fn set_file_group(&mut self, path: &str, group: &str) {
+        self.file_groups.insert(path.to_owned(), group.to_owned());
     }
 
     /// Return the ordered log of mutating calls made against this backend
@@ -241,8 +257,10 @@ impl FileBackend for FakeBackend {
             return Err(GelError::Backend("injected remove_file failure".to_owned()));
         }
         self.files.remove(path);
-        // a removed file carries no mode, so drop any tracked mode with it
+        // a removed file carries no mode or ownership, so drop any tracked ones
         self.file_modes.remove(path);
+        self.file_owners.remove(path);
+        self.file_groups.remove(path);
         self.calls.push(call);
         Ok(())
     }
@@ -264,6 +282,44 @@ impl FileBackend for FakeBackend {
             return Err(GelError::Backend("injected set_mode failure".to_owned()));
         }
         self.file_modes.insert(path.to_owned(), mode);
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn owner(&self, path: &str) -> Result<Option<String>, GelError> {
+        // an absent file has no owner; a present file reports a stored owner only
+        // when one was set, mirroring mode's unmanaged-is-None semantics
+        if !self.files.contains_key(path) {
+            return Ok(None);
+        }
+        Ok(self.file_owners.get(path).cloned())
+    }
+
+    fn group(&self, path: &str) -> Result<Option<String>, GelError> {
+        if !self.files.contains_key(path) {
+            return Ok(None);
+        }
+        Ok(self.file_groups.get(path).cloned())
+    }
+
+    fn set_owner(&mut self, path: &str, owner: &str) -> Result<(), GelError> {
+        let call = Call::SetFileOwner(path.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected set_owner failure".to_owned()));
+        }
+        self.file_owners.insert(path.to_owned(), owner.to_owned());
+        self.calls.push(call);
+        Ok(())
+    }
+
+    fn set_group(&mut self, path: &str, group: &str) -> Result<(), GelError> {
+        let call = Call::SetFileGroup(path.to_owned());
+        if self.take_failure(&call) {
+            self.calls.push(call);
+            return Err(GelError::Backend("injected set_group failure".to_owned()));
+        }
+        self.file_groups.insert(path.to_owned(), group.to_owned());
         self.calls.push(call);
         Ok(())
     }
@@ -489,6 +545,80 @@ mod tests {
         // the next matching set_mode succeeds now that the failure is consumed
         backend.set_mode("/etc/exports", 0o644).expect("set_mode");
         assert_eq!(backend.mode("/etc/exports").expect("mode"), Some(0o644));
+    }
+
+    #[test]
+    fn set_owner_and_group_record_calls_and_read_back() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+
+        backend
+            .set_owner("/etc/exports", "root")
+            .expect("set_owner");
+        backend.set_group("/etc/exports", "nfs").expect("set_group");
+
+        assert_eq!(
+            backend.owner("/etc/exports").expect("owner"),
+            Some("root".to_owned())
+        );
+        assert_eq!(
+            backend.group("/etc/exports").expect("group"),
+            Some("nfs".to_owned())
+        );
+        assert_eq!(
+            backend.calls(),
+            &[
+                Call::SetFileOwner("/etc/exports".to_owned()),
+                Call::SetFileGroup("/etc/exports".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn owner_and_group_are_none_for_absent_file() {
+        use crate::backend::file::FileBackend;
+
+        let backend = FakeBackend::default();
+
+        assert_eq!(backend.owner("/etc/exports").expect("owner"), None);
+        assert_eq!(backend.group("/etc/exports").expect("group"), None);
+    }
+
+    #[test]
+    fn remove_file_clears_owner_and_group() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_file_owner("/etc/exports", "root");
+        backend.set_file_group("/etc/exports", "nfs");
+
+        backend.remove_file("/etc/exports").expect("remove");
+
+        assert_eq!(backend.owner("/etc/exports").expect("owner"), None);
+        assert_eq!(backend.group("/etc/exports").expect("group"), None);
+    }
+
+    #[test]
+    fn injected_set_owner_failure_is_one_shot() {
+        use crate::backend::file::FileBackend;
+
+        let mut backend = FakeBackend::with_files(&[("/etc/exports", "x\n")]);
+        backend.set_fail_on(Call::SetFileOwner(String::new()));
+
+        // first matching set_owner fails and does not mutate state
+        let first = backend.set_owner("/etc/exports", "root");
+        assert!(first.is_err());
+        assert_eq!(backend.owner("/etc/exports").expect("owner"), None);
+
+        // the next matching set_owner succeeds now that the failure is consumed
+        backend
+            .set_owner("/etc/exports", "root")
+            .expect("set_owner");
+        assert_eq!(
+            backend.owner("/etc/exports").expect("owner"),
+            Some("root".to_owned())
+        );
     }
 
     #[test]

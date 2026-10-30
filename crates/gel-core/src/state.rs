@@ -16,6 +16,21 @@ pub struct ManagedFile {
     /// declared mode serializes exactly as it did before mode existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
+    /// Desired owning user name, e.g. `"root"`, or `None` to leave ownership
+    /// unmanaged
+    ///
+    /// Defaulted and skipped when absent so artifacts predating ownership
+    /// management still deserialize and a file with no declared owner serializes
+    /// as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Desired owning group name, e.g. `"root"`, or `None` to leave the group
+    /// unmanaged
+    ///
+    /// Independent of [`ManagedFile::owner`]: either may be managed without the
+    /// other. Defaulted and skipped when absent, like `owner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Explicit intent over systemd units, expressed as two disjoint lists
@@ -145,6 +160,7 @@ mod tests {
             path: "/etc/exports".to_owned(),
             content: "/srv 10.0.0.0/8(ro)\n".to_owned(),
             mode: Some(0o644),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&file).expect("serialize");
@@ -173,11 +189,42 @@ mod tests {
             path: "/etc/motd".to_owned(),
             content: "hi\n".to_owned(),
             mode: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&file).expect("serialize");
 
         assert!(!json.contains("mode"));
+    }
+
+    #[test]
+    fn managed_file_owner_and_group_roundtrip() {
+        let file = ManagedFile {
+            path: "/etc/exports".to_owned(),
+            content: "x\n".to_owned(),
+            mode: None,
+            owner: Some("root".to_owned()),
+            group: Some("nfs".to_owned()),
+        };
+
+        let json = serde_json::to_string(&file).expect("serialize");
+        let back: ManagedFile = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(file, back);
+    }
+
+    #[test]
+    fn managed_file_without_owner_group_omits_the_keys() {
+        let file = ManagedFile {
+            path: "/etc/motd".to_owned(),
+            content: "hi\n".to_owned(),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&file).expect("serialize");
+
+        assert!(!json.contains("owner"));
+        assert!(!json.contains("group"));
     }
 
     #[test]

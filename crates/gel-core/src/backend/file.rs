@@ -44,4 +44,32 @@ pub trait FileBackend {
     ///
     /// Returns [`GelError`] if the backend fails to change the file's mode.
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), GelError>;
+
+    /// Return the current owning user name of `path`, or `None` if it is absent
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to read the file's owner.
+    fn owner(&self, path: &str) -> Result<Option<String>, GelError>;
+
+    /// Return the current owning group name of `path`, or `None` if it is absent
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to read the file's group.
+    fn group(&self, path: &str) -> Result<Option<String>, GelError>;
+
+    /// Set the owning user of `path` to `owner`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to change the file's owner.
+    fn set_owner(&mut self, path: &str, owner: &str) -> Result<(), GelError>;
+
+    /// Set the owning group of `path` to `group`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GelError`] if the backend fails to change the file's group.
+    fn set_group(&mut self, path: &str, group: &str) -> Result<(), GelError>;
 }
